@@ -10,6 +10,7 @@ from std_msgs.msg import Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import (
     VehicleTorqueSetpoint, VehicleAngularVelocity, VehicleCommand,
+    HealthReport,BatteryStatus,
     OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleAttitudeSetpoint,
     VehicleRatesSetpoint, VehicleLocalPosition
 )
@@ -85,9 +86,13 @@ class FlipControlNode(Node):
         #self.create_subscription(Float32, 'rc_channel_mode', self.interpret_rc, qos_profile)
         self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
-
         self.create_subscription(Vector3, '/fmu/out/sensor_combined', self.imu_callback, qos_profile)
         self.create_subscription(Quaternion, '/fmu/out/vehicle_attitude', self.imu_attitude_callback, qos_profile) # содержит ориентацию дрона в виде кватерниона
+
+        # Подписки на состояние дрона
+        self.create_subscription(HealthReport, '/fmu/out/health_report', self.health_report_callback, qos_profile)
+        #self.create_subscription(BatteryStatus, '/fmu/out/battery_status', self.battery_status_callback, qos_profile)
+        self.create_subscription(TrajectorySetpoint, '/fmu/out/trajectory_setpoint', self.trajectory_actual_callback, qos_profile)
 
         # Переменные состояния
         self.vehicle_status = VehicleStatus()
@@ -100,7 +105,14 @@ class FlipControlNode(Node):
         self.vx = 0
         self.vy = 0
         self.vz = 0
-        self.timestamp = 0
+        self.timestamp = 0 
+
+        self.arming_state = 0  # 0 - не армирован
+        self.nav_state = 0  # 0 - начальное состояние
+        self.health_warning = False  # нет предупреждений о здоровье
+        self.battery_voltage = 0.0  # начальное значение напряжения
+        self.battery_remaining = 0.0  # начальный уровень заряда
+        self.current_position = (0.0, 0.0, 0.0)  # начальная позиция (x, y, z)
 
         self.flip_stage = FlipStage.INIT
         #self.state = FlipStage.INIT
@@ -121,14 +133,30 @@ class FlipControlNode(Node):
         self.create_timer(0.1, self.offboard_heartbeat)
 
 
+    def health_report_callback(self, msg):
+        self.health_warning = msg.arming_check_warning
+        if self.health_warning:
+            self.get_logger().warn("Ошибка в системе здоровья!")
+
+    # def battery_status_callback(self, msg):
+    #     self.battery_voltage = msg.voltage_v
+    #     self.battery_remaining = msg.remaining
+    #     self.get_logger().info(f"Батарея: {self.battery_voltage:.2f} В, Заряд: {self.battery_remaining:.2%}")
+
+    def trajectory_actual_callback(self, msg):
+        self.current_position = (msg.x, msg.y, msg.z)
+        #self.get_logger().info(f"Текущая цель: x={msg.x}, y={msg.y}, z={msg.z}")
+
     def vehicle_local_position_callback(self, vehicle_local_position):
         """Callback function for vehicle_local_position topic subscriber."""
         self.vehicle_local_position = vehicle_local_position
 
     def vehicle_status_callback(self, msg):
         """Обновляет состояние дрона."""
-        self.get_logger().info('vehicle_status_callback')
+        #self.get_logger().info('vehicle_status_callback')
         self.vehicle_status = msg
+        self.arming_state = msg.arming_state
+        self.nav_state = msg.nav_state
 
     # def position_callback(self, msg): 
     #     self.x = msg.x
@@ -338,9 +366,9 @@ class FlipControlNode(Node):
          
         elif self.flip_stage == FlipStage.ARMING:
             self.get_logger().info('FlipStage.ARMING')
-            self.get_logger().warn(f"vehicle_status.arming_state: {self.vehicle_status.arming_state}")
-            self.get_logger().info(f"self.vehicle_status.nav_state: {self.vehicle_status.nav_state}")
-            if self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+            self.get_logger().warn(f"arm_state: {self.arming_state}")
+            self.get_logger().info(f"nav_state: {self.nav_state}")
+            if self.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self.get_logger().info('ARMING_STATE_ARMED')
                 self.flip_stage = FlipStage.TAKEOFF
             else:
@@ -351,7 +379,8 @@ class FlipControlNode(Node):
         elif self.flip_stage == FlipStage.TAKEOFF:
             self.get_logger().info('FlipStage.TAKEOFF')
             self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)
-            #self.get_logger().info(f"self.vehicle_local_position.z: {self.vehicle_local_position.z} self.takeoff_height: {self.takeoff_height} res:{self.vehicle_local_position.z  + 0.2 <= -self.takeoff_height}") 
+            self.get_logger().info(f'self.arming_state {self.arming_state} {self.health_warning}')
+            self.get_logger().info(f"self.vehicle_local_position.z: {self.vehicle_local_position.z} self.takeoff_height: {self.takeoff_height} res:{self.vehicle_local_position.z  + 0.2 <= -self.takeoff_height}") 
             if self.vehicle_local_position.z  - 0.5 <= -self.takeoff_height:
                 self.flip_stage = FlipStage.READY_FOR_FLIP
                 self.get_logger().info('FlipStage.READY_FOR_FLIP')
