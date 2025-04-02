@@ -3,6 +3,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Quaternion, Vector3
+from scipy.spatial.transform import Rotation as R
 import tf2_ros
 import tf2_geometry_msgs
 import tf_transformations
@@ -12,9 +13,9 @@ from px4_msgs.msg import (
     VehicleTorqueSetpoint, VehicleAngularVelocity, VehicleCommand,
     HealthReport,BatteryStatus,
     OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleAttitudeSetpoint,
-    VehicleRatesSetpoint, VehicleLocalPosition
+    VehicleRatesSetpoint, VehicleLocalPosition, ActuatorMotors
 )
-
+import numpy as np
 from enum import Enum 
 
 # Временные параметры
@@ -44,25 +45,14 @@ class FlipStage(Enum):
     FLIPPING = 15
     LANDING = 16
 
-    
-# class FlipStage(Enum):
-#     INIT = 0
-#     ARMING = 1
-#     TAKEOFF = 2
-#     READY_FOR_FLIP = 3
-#     FLIPPING = 4
-#     LANDING = 5
-#     DISARMED = 6
-
-
-class EulerAngles:
-    """
-    Класс для представления углов Эйлера.
-    """
-    def __init__(self, roll, pitch, yaw):
-        self.roll = roll   # roll
-        self.pitch = pitch  # pitch
-        self.yaw = yaw    # yaw
+# class EulerAngles:
+#     """
+#     Класс для представления углов Эйлера.
+#     """
+#     def __init__(self, roll, pitch, yaw):
+#         self.roll = roll   # roll
+#         self.pitch = pitch  # pitch
+#         self.yaw = yaw    # yaw
 
 class FlipControlNode(Node):
     def __init__(self):
@@ -82,14 +72,13 @@ class FlipControlNode(Node):
         self.vehicle_torque_publisher = self.create_publisher(VehicleTorqueSetpoint, '/fmu/in/vehicle_torque_setpoint', qos_profile)
 
         # Подписки на состояние дрона
-        # Subscribers
-        #self.create_subscription(Float32, 'rc_channel_mode', self.interpret_rc, qos_profile)
         self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         self.create_subscription(Vector3, '/fmu/out/sensor_combined', self.imu_callback, qos_profile)
-        self.create_subscription(Quaternion, '/fmu/out/vehicle_attitude', self.imu_attitude_callback, qos_profile) # содержит ориентацию дрона в виде кватерниона
+        self.create_subscription(Quaternion, '/fmu/out/vehicle_attitude', self.vehicle_attitude_callback, qos_profile) # содержит ориентацию дрона в виде кватерниона
 
-        # Подписки на состояние дрона
+        self.create_subscription(Vector3, '/fmu/out/vehicle_angular_velocity', self.angular_velocity_callback, qos_profile)
+        self.create_subscription(ActuatorMotors, '/fmu/out/actuator_controls_0', self.actuator_controls_callback, qos_profile)
         self.create_subscription(HealthReport, '/fmu/out/health_report', self.health_report_callback, qos_profile)
         #self.create_subscription(BatteryStatus, '/fmu/out/battery_status', self.battery_status_callback, qos_profile)
         self.create_subscription(TrajectorySetpoint, '/fmu/out/trajectory_setpoint', self.trajectory_actual_callback, qos_profile)
@@ -122,22 +111,91 @@ class FlipControlNode(Node):
 
         self.thrust_target = 0.0
         self.last_time = -999
-        self.max_rate = 0.0 
+        self.max_roll_rate = 0.0 
         self.acceleration_angle_z = 0.0
         self.acceleration_when_rotating_time = 0.0 
-        self.rates = Vector3()
+        #self.rates = Vector3()
         self.attitude = Quaternion()
+
+        # angular_velocity_callback
+        self.angular_accel = 0.0
+        self.roll_rate = 0.0
+        self.pitch_rate = 0.0
+        self.yaw_rate = 0.0
+        #actuator_controls_callback
+        self.torque_roll = 0.0
+        self.torque_pitch = 0.0
+        self.torque_yaw = 0.0
 
         # Таймеры
         self.create_timer(0.1, self.update)
         self.create_timer(0.1, self.offboard_heartbeat)
 
 
+    # Maths functions start
+
+    def rotate_vector_by_quaternion(self, vector, quat):
+
+        qx, qy, qz, qw = quat.x, quat.y, quat.z, quat.w
+        vx, vy, vz = vector.x, vector.y, vector.z
+
+        tx = 2 * (qy * vz - qz * vy)
+        ty = 2 * (qz * vx - qx * vz)
+        tz = 2 * (qx * vy - qy * vx)
+
+        result_x = vx + qw * tx + (qy * tz - qz * ty)
+        result_y = vy + qw * ty + (qz * tx - qx * tz)
+        result_z = vz + qw * tz + (qx * ty - qy * tx)
+
+        return Vector3(x=result_x, y=result_y, z=result_z)
+
+    def quaternion_from_euler(self, roll, pitch, yaw):
+        r = R.from_euler('xyz', [roll, pitch, yaw])
+        return np.array(r.as_quat(), dtype=np.float32)  # Убедимся, что это numpy.float32
+    
+    def euler_from_quaternion(self):
+        quat = self.attitude
+        """Преобразование кватерниона в углы Эйлера (возвращает roll, pitch, yaw)."""
+        r = R.from_quat([quat.x, quat.y, quat.z, quat.w])
+        return r.as_euler('xyz')
+
+    # def toEulerZYX(self):
+    #     """
+    #     Преобразует кватернион в углы Эйлера (roll, pitch, yaw).
+        
+    #     :return: Объект EulerAngles с аттрибутами roll, pitch, yaw
+    #     """
+    #     if self.attitude is None:
+    #         return None  # Если кватернион не задан
+        
+    #     q = [self.attitude.x, self.attitude.y, self.attitude.z, self.attitude.w]
+    #     roll, pitch, yaw = tf_transformations.euler_from_quaternion(q)
+
+    #     return EulerAngles(roll, pitch, yaw)
+    # Maths functions end
+
+
+    # callbacks start
+
+    def angular_velocity_callback(self, msg):
+        self.roll_rate, self.pitch_rate, self.yaw_rate = msg.xyz  # рад/с
+        self.angular_accel = msg.xyz_derivative  # рад/с²
+        # self.get_logger().info(f"Rates: roll={roll_rate}, pitch={pitch_rate}, yaw={yaw_rate}")
+        # self.get_logger().info(f"Angular acceleration: {angular_accel}")
+
+    def actuator_controls_callback(self, msg):
+        """ Управляющие моменты, которые PX4 передает в контроллер двигателя """
+        self.torque_roll = msg.control[0]  # момент вокруг оси X (roll)
+        self.torque_pitch = msg.control[1]  # момент вокруг оси Y (pitch)
+        self.torque_yaw = msg.control[2]  # момент вокруг оси Z (yaw)
+        #self.get_logger().info(f"Torques: roll={torque_roll}, pitch={torque_pitch}, yaw={torque_yaw}")
+
     def health_report_callback(self, msg):
         self.health_warning = msg.arming_check_warning
         if self.health_warning:
             self.get_logger().warn("Ошибка в системе здоровья!")
 
+    """use it with real drone"""
     # def battery_status_callback(self, msg):
     #     self.battery_voltage = msg.voltage_v
     #     self.battery_remaining = msg.remaining
@@ -158,77 +216,24 @@ class FlipControlNode(Node):
         self.arming_state = msg.arming_state
         self.nav_state = msg.nav_state
 
-    # def position_callback(self, msg): 
-    #     self.x = msg.x
-    #     self.y = msg.y
-    #     self.z = msg.z
-    #     self.vx = msg.vx
-    #     self.vy = msg.vy
-    #     self.vz = msg.vz
-    #     self.timestamp = msg.timestamp 
-    #     # self.get_logger().info(f'Updated Position: x={self.x} y={self.y} z={self.z}')
-    #     # self.get_logger().info(f'Updated Speed: vx={self.vx} vy={self.vy} vz={self.vz}')
-    #     # self.get_logger().info(f'Updated Timestamp: {self.timestamp}')
-
     def imu_callback(self, msg):
-        self.rates = msg
+        print()
+        #self.rates = msg
+    
+    
+    def vehicle_attitude_callback(self, msg):
+        self.attitude = msg.q 
 
-    def imu_attitude_callback(self, msg):
-        self.attitude = msg
+    # callbacks ends
 
-
-    # def toEulerZYX(self):
-    #     quaternion = Quaternion(x=self.attitude.x, y=self.attitude.y, z=self.attitude.z, w=self.attitude.w)
-    #     roll, pitch, yaw = tf_transformations.euler_from_quaternion(quaternion)
-    #     return roll, pitch, yaw  # Возвращает кортеж (рад)
-
-    def toEulerZYX(self):
-        """
-        Преобразует кватернион в углы Эйлера (roll, pitch, yaw).
-        
-        :return: Объект EulerAngles с аттрибутами roll, pitch, yaw
-        """
-        if self.attitude is None:
-            return None  # Если кватернион не задан
-        
-        q = [self.attitude.x, self.attitude.y, self.attitude.z, self.attitude.w]
-        roll, pitch, yaw = tf_transformations.euler_from_quaternion(q)
-
-        # Возвращаем объект EulerAngles с углами Эйлера
-        return EulerAngles(roll, pitch, yaw)
-    # def toEulerZYX(self):
-    #     """
-    #     Преобразует кватернион в углы Эйлера (roll, pitch, yaw).
-        
-    #     :return: Объект с аттрибутами x (roll), y (pitch), z (yaw)
-    #     """
-    #     if self.attitude is None:
-    #         return None
-
-    #     # Преобразуем кватернион в углы Эйлера с использованием tf2
-    #     quaternion = Quaternion(x=self.attitude.x, y=self.attitude.y, z=self.attitude.z, w=self.attitude.w)
-        
-    #     # Инициализация tf2 Buffer и TransformListener
-    #     self.tf_buffer = tf2_ros.Buffer()
-    #     self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-    #     # Используем tf2 для преобразования кватерниона в углы Эйлера
-    #     euler_angles = tf2_geometry_msgs.do_transform_euler(quaternion)
-        
-    #     # Создаем объект с аттрибутами x, y, z для углов Эйлера
-    #     EulerZYX = type('EulerZYX', (object,), {})  # Динамично создаем класс
-    #     euler = EulerZYX()
-    #     euler.x = euler_angles.x
-    #     euler.y = euler_angles.y
-    #     euler.z = euler_angles.z
-
-    #     return euler
-
+     
+    # send functions
     def send_land_command(self):
         land_cmd = VehicleCommand()
-        land_cmd.command = VehicleCommand.VEHICLE_CMD_DO_LAND
-        land_cmd.param1 = 0  # Приземление (не отменять)
-        land_cmd.param2 = 0  # Опция (оставляем по умолчанию)
-        land_cmd.param3 = 0  # Нет конкретной цели (текущая позиция)
+        land_cmd.command = VehicleCommand.VEHICLE_CMD_NAV_LAND
+        land_cmd.param1 = 0.0  # Приземление (не отменять)
+        land_cmd.param2 = 0.0  # Опция (оставляем по умолчанию)
+        land_cmd.param3 = 0.0  # Нет конкретной цели (текущая позиция)
         self.vehicle_command_publisher.publish(land_cmd)
         self.get_logger().info('Sending land command.')
         
@@ -252,11 +257,11 @@ class FlipControlNode(Node):
         trajectory_msg.timestamp = int(time.time() * 1e6)
         self.trajectory_setpoint_publisher.publish(trajectory_msg)
 
-    def publish_rate_setpoint(self, rates):
+    def publish_rate_setpoint(self, roll_rate, pitch_rate, yaw_rate):
         rate_msg = VehicleRatesSetpoint()
-        rate_msg.roll = rates.x  # Roll rate
-        rate_msg.pitch = rates.y  # Pitch rate
-        rate_msg.yaw = rates.z  # Yaw rate
+        rate_msg.roll = roll_rate 
+        rate_msg.pitch = pitch_rate
+        rate_msg.yaw = yaw_rate
         rate_msg.timestamp = int(time.time() * 1e6)
         self.vehicle_rates_publisher.publish(rate_msg)
 
@@ -268,12 +273,16 @@ class FlipControlNode(Node):
         torque_msg.timestamp = int(time.time() * 1e6)
         self.vehicle_torque_publisher.publish(torque_msg)
 
-    def publish_attitude_setpoint(self, roll, pitch, yaw):
+    def publish_attitude_setpoint(self, roll, pitch, yaw, thrust):
         attitude_msg = VehicleAttitudeSetpoint()
-        attitude_msg.roll_body = roll
-        attitude_msg.pitch_body = pitch
-        attitude_msg.yaw_body = yaw
-        attitude_msg.thrust_body[2] = -self.thrust_target  # Negative Z thrust
+        attitude_msg.q_d = self.quaternion_from_euler(roll, pitch, yaw)  # Устанавливаем кватернион
+        attitude_msg.thrust_body[2] = -thrust  # Negative Z thrust
+        attitude_msg.timestamp = int(time.time() * 1e6)
+        self.attitude_setpoint_publisher.publish(attitude_msg)
+    
+    def publish_thrust_setpoint(self, thrust):
+        attitude_msg = VehicleAttitudeSetpoint()
+        attitude_msg.thrust_body[2] = -thrust  # Negative Z thrust
         attitude_msg.timestamp = int(time.time() * 1e6)
         self.attitude_setpoint_publisher.publish(attitude_msg)
     
@@ -289,29 +298,13 @@ class FlipControlNode(Node):
         msg.timestamp = int(time.time() * 1e6)
         self.vehicle_command_publisher.publish(msg)
 
-    def rotate_vector_by_quaternion(self, vector, quat):
-            qx, qy, qz, qw = quat.x, quat.y, quat.z, quat.w
-            vx, vy, vz = vector.x, vector.y, vector.z
-
-            tx = 2 * (qy * vz - qz * vy)
-            ty = 2 * (qz * vx - qx * vz)
-            tz = 2 * (qx * vy - qy * vx)
-
-            result_x = vx + qw * tx + (qy * tz - qz * ty)
-            result_y = vy + qw * ty + (qz * tx - qx * tz)
-            result_z = vz + qw * tz + (qx * ty - qy * tx)
-
-            return Vector3(x=result_x, y=result_y, z=result_z)
-
     def set_motor_commands(self, motor_rear_left, motor_rear_right, motor_front_left, motor_front_right):
             """
             Функция для отправки команд включения моторов в режим Offboard.
             Каждый мотор включается/выключается через команду VehicleCommand.
             """
-
             # Команда VehicleCommand для управления моторами
             vehicle_command = VehicleCommand()
-
             # Для включения моторов можно использовать команду типа MOTOR_SET, которая управляет каждым из моторов
             # Важно: значения могут быть от 0 (выключен) до 1 (включен)
             vehicle_command.command = 183  # 183 - это команда для управления моторами
@@ -325,7 +318,7 @@ class FlipControlNode(Node):
             self.vehicle_command_publisher.publish(vehicle_command)
 
     def reset_rate_pid(self): 
-        self.publish_rate_setpoint(Vector3(x=0.0, y=0.0, z=0.0))
+        self.publish_rate_setpoint(roll_rate=0.0, pitch_rate=0.0, yaw_rate=0.0)
 
     def set_offboard_mode(self):
         """Switch to offboard mode."""
@@ -339,9 +332,11 @@ class FlipControlNode(Node):
         self.publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0)
         self.get_logger().info('Arm command sent')
-  
 
-    # Должен постоянно отсылаться, чтобы оставаться в offboard
+    # send functions end
+
+
+    """ Дрон должен постоянно получать это сообщение чтобы оставаться в offboard """
     def offboard_heartbeat(self):
          if self.offboard_is_active:
                 self.get_logger().info("Sending SET_MODE OFFBOARD") 
@@ -355,10 +350,12 @@ class FlipControlNode(Node):
                 msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
                 self.offboard_control_mode_publisher.publish(msg)
 
+    # main spinned function
     def update(self):
-        #self.get_logger().info(f"flip_stage: {self.flip_stage}")  
+
         self.get_logger().info(f"flip_stage: {self.flip_stage}")
-        # new from base
+        self.get_logger().info(f'self.acceleration_when_rotating_time{self.acceleration_when_rotating_time}')
+    
         if self.flip_stage == FlipStage.INIT:
             self.set_offboard_mode()
             self.arm()
@@ -375,7 +372,6 @@ class FlipControlNode(Node):
                 self.set_offboard_mode()
                 self.arm()
 
-        
         elif self.flip_stage == FlipStage.TAKEOFF:
             self.get_logger().info('FlipStage.TAKEOFF')
             self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)
@@ -385,218 +381,114 @@ class FlipControlNode(Node):
                 self.flip_stage = FlipStage.READY_FOR_FLIP
                 self.get_logger().info('FlipStage.READY_FOR_FLIP')
 
+
+ 
         elif self.flip_stage == FlipStage.READY_FOR_FLIP:
-            self.flip_active = True
-            euler_angles = self.toEulerZYX()# wait for ideal conditions
-            self.get_logger().info(f"euler_angles[{euler_angles.roll},{euler_angles.pitch}, {euler_angles.yaw}] self.rates.x:{self.rates.x} val:{abs(self.rates.x) < 0.05 and (abs(euler_angles.roll) < 0.02)}")
-            if euler_angles != None:
-                if (abs(self.rates.x) < 0.05 and (abs(euler_angles.roll) < 0.02)):
+            euler_angles = self.euler_from_quaternion() # self.toEulerZYX()# wait for ideal conditions
+            self.get_logger().info(f'euler_angles {euler_angles[0]} {euler_angles[1]} {euler_angles[2]}')
+            if euler_angles is not None:
+                if (abs(self.roll_rate) < 0.05 and (abs(euler_angles[0]) < 0.02)):
                     self.flip_stage = FlipStage.BOUNCE
                     self.stage_time =  time.time()
 
         elif self.flip_stage == FlipStage.BOUNCE:
-            # msg = TrajectorySetpoint()
-            # msg.timestamp = int(time.time() * 1e6)
-            # msg.velocity = [0.0, 0.0, 0.5]
-            self.thrust_target = 0.8  # Устанавливаем желаемую тягу, отправляется с publish_attitude_setpoint
-            attitude_target = self.quaternion_from_euler(0, 0, self.attitude.yaw)  # Установка целевой ориентации
-            self.publish_attitude_setpoint(attitude_target)  # Управление ориентацией
-            self.publish_rate_setpoint(self.rates)  # Управление угловыми скоростями, self.rates обновл в callback
-            self.publish_torque_setpoint(self.rates)  # Управление крутящими моментами
+            #euler = self.euler_from_quaternion()
+            self.publish_attitude_setpoint(roll=0.0, pitch=0.0, yaw=self.euler_from_quaternion()[2], thrust=0.8)  # Управление ориентацией, отправляется и self.thrust_target
+            """ self.angular_accel (рад/с²), self.roll_rate, self.pitch_rate, self.yaw_rate (рад/с) """
+            self.publish_rate_setpoint(roll_rate=self.roll_rate, pitch_rate=self.pitch_rate, yaw_rate=self.yaw_rate) # Управление углолвыми скоростями
+            self.publish_torque_setpoint(self.torque_roll, self.torque_pitch, self.torque_yaw)  # Управление крутящими моментами
             #controlAttitude()
 		    #controlRate()
 		    #controlTorque()
             #self.trajectory_setpoint_publisher.publish(msg)
+            t = time.time()
             if t - self.stage_time > BOUNCE_TIME:
                 self.flip_stage = FlipStage.ACCELERATE
+                self.stage_time = time.time()
+                
+        elif self.flip_stage == FlipStage.ACCELERATE:
+            # Управление моментами для ускорения
+            self.publish_torque_setpoint(roll_torque=1.0, pitch_torque=0.0, yaw_torque=0.0) 
+            # Обнуление углов ориентации
+            self.publish_attitude_setpoint(roll=0.0, pitch=0.0, yaw=0.0, thrust=0.1)
+            # Обнуляем угловые скорости  
+            self.reset_rate_pid()
+
+            # Включаем моторы (управление моторами)
+            self.set_motor_commands(
+                motor_rear_left=1.0,
+                motor_rear_right=0.0,
+                motor_front_left=1.0,
+                motor_front_right=0.0
+                ) 
+            t = time.time()
+            if t - self.stage_time > 0.3:
+                self.flip_stage = FlipStage.ROTATE
                 self.stage_time = t
 
+        elif self.flip_stage == FlipStage.ROTATE:
+            self.publish_attitude_setpoint
+            self.publish_attitude_setpoint(roll=0.0, pitch=0.0, yaw=0.0, thrust=0.2)  # Убрать управление углами 
+            self.publish_torque_setpoint(roll_torque=0.0, pitch_torque=0.0, yaw_torque=0.0)  # Обнуление моментов
+            self.reset_rate_pid()
+            self.set_motor_commands(
+                motor_rear_left=0.0, 
+                motor_rear_right=0.0, 
+                motor_front_left=0.0, 
+                motor_front_right=0.0)
+            t = time.time()  
+            up_vector = self.rotate_vector_by_quaternion(Vector3(x=0.0, y=0.0, z=-1.0), self.attitude)
+            if abs(self.roll_rate) > abs(self.max_roll_rate):
+                self.max_roll_rate = self.roll_rate
+                self.acceleration_angle_z = up_vector.z
+                self.acceleration_when_rotating_time = t - self.stage_time
 
-            # else:
-            #     self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)  # Поддержание высоты
-            #     self.publish_attitude_setpoint(-roll * 0.1, 0.0, 0.0)  # Стабилизация крена
+            if up_vector.z < self.acceleration_angle_z:
+                self.flip_stage = FlipStage.BRAKE
+                self.stage_time = t
+    
+        elif self.flip_stage == FlipStage.BRAKE:
+            # Публикация команд для контроля тяги и моментов
+            self.publish_attitude_setpoint(roll=0.0, pitch=0.0, yaw=0.0, thrust=0.3)  # Обнуление углов
+            self.publish_rate_setpoint(roll_rate=0.0, pitch_rate=0.0, yaw_rate=0.0)  # Стабилизация угловых скоростей
+            self.publish_torque_setpoint(0.0, 0.0, 0.0)  # Обнуление моментов
+            # Управление моторами для торможения
+            self.set_motor_commands(
+                motor_rear_left=0.0, 
+                motor_rear_right=1.0, 
+                motor_front_left=0.0, 
+                motor_front_right=1.0)
+            t = time.time()
+            if t - self.stage_time > BRAKE_TIME:
+                self.flip_stage = FlipStage.POST_BRAKE
+                self.stage_time = t
+        elif self.flip_stage == FlipStage.POST_BRAKE:
+            self.publish_attitude_setpoint(roll=0.0, pitch=0.0, yaw=0.0, thrust=0.4)  # Обнуление углов
+            self.set_motor_commands(
+                motor_rear_left=0.3, 
+                motor_rear_right=0.3, 
+                motor_front_left=0.3, 
+                motor_front_right=0.3)
+            t = time.time()
+            if t - self.stage_time > self.acceleration_when_rotating_time:
+                self.flip_stage = FlipStage.LAND
+                self.stage_time = t
+                self.reset_rate_pid()
+                # rollRatePID.reset()
+                # pitchRatePID.reset()
+                # yawRatePID.reset()
 
-        # new from base
-        #  change
-        # """Основная логика управления."""
-        # if self.vehicle_status is None:
-        #     return
-        # t = time.time()
+            # Увеличиваем тягу в первые 0.4 секунды для стабилизации
+            if t - self.stage_time < 0.4:
+                self.publish_thrust_setpoint(thrust=0.8)  # Отправляем команду для увеличения тяги
 
-        # if self.flip_stage == FlipStage.DISARMED:
-        #     self.get_logger().info("DISARMED")
-        #     self.arm()
-        #     self.offboard_is_active = True
-        #     self.stage_time = t
-        #     self.flip_stage = FlipStage.OFFBOARD 
-
-        # elif self.flip_stage == FlipStage.OFFBOARD: 
-        #     self.get_logger().info(f"self.vehicle_status.nav_state: {self.vehicle_status.nav_state}") 
-        #     if self.vehicle_status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD and self.vehicle_status.arming_state == 2:
-        #         self.get_logger().info("Drone armed and in offboard mode")
-        #         self.stage_time = t
-        #         self.flip_stage = FlipStage.TAKEOFF
-        #         self.publish_vehicle_command(400, 1.0)  # Команда ARM
-        #     elif t - self.stage_time > OFFBOARD_TIMEOUT:
-        #         self.get_logger().warn("OFFBOARD timeout!")
-        #         self.flip_stage = FlipStage.DISARMED
-        #chage
-
-
-
-
-
-
-        # elif self.flip_stage == FlipStage.ARMING:
-        #     self.get_logger().info(f"self.vehicle_status.nav_state: {self.vehicle_status.nav_state}")
-        #     self.publish_vehicle_command(400, 1.0)  # может не нужно пулинг команды арм
-        #     if self.vehicle_status.arming_state == 2:  
-        #         self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)
-        #         self.flip_stage = FlipStage.TAKEOFF
-        #         self.stage_time = t
-        #     elif t - self.stage_time > ARM_TIMEOUT:
-        #         self.get_logger().warn("ARM timeout!")
-        #         self.flip_stage = FlipStage.TAKEOFF
-
-        
-        # elif self.flip_stage == FlipStage.WAIT:
-        #     euler_angles = self.toEulerZYX()# wait for ideal conditions
-        #     if euler_angles != None:
-        #         if (abs(self.rates.x) < 0.05 and (abs(euler_angles.x) < 0.02)):
-        #             self.flip_stage = FlipStage.BOUNCE
-        #             self.stage_time = t
-        #     # else:
-        #     #     self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)  # Поддержание высоты
-        #     #     self.publish_attitude_setpoint(-roll * 0.1, 0.0, 0.0)  # Стабилизация крена
-		
-        # elif self.flip_stage == FlipStage.BOUNCE:
-        #     # msg = TrajectorySetpoint()
-        #     # msg.timestamp = int(time.time() * 1e6)
-        #     # msg.velocity = [0.0, 0.0, 0.5]
-        #     self.thrust_target = 0.8  # Устанавливаем желаемую тягу, отправляется с publish_attitude_setpoint
-        #     attitude_target = self.quaternion_from_euler(0, 0, self.attitude.yaw)  # Установка целевой ориентации
-        #     self.publish_attitude_setpoint(attitude_target)  # Управление ориентацией
-        #     self.publish_rate_setpoint(self.rates)  # Управление угловыми скоростями, self.rates обновл в callback
-        #     self.publish_torque_setpoint(self.rates)  # Управление крутящими моментами
-        #     #controlAttitude()
-		#     #controlRate()
-		#     #controlTorque()
-        #     #self.trajectory_setpoint_publisher.publish(msg)
-        #     if t - self.stage_time > BOUNCE_TIME:
-        #         self.flip_stage = FlipStage.ACCELERATE
-        #         self.stage_time = t
-
-        # elif self.flip_stage == FlipStage.ACCELERATE:
-        #     self.thrust_target = 0.1  # Уменьшенная тяга, передается в publish_attitude_setpoint
-
-        #     # Управление моментами для ускорения
-        #     roll_torque = 1.0  # Ускорение вокруг оси крена
-        #     pitch_torque = 0.0  # Нет ускорения по оси тангажа
-        #     yaw_torque = 0.0  # Нет ускорения по оси рыскания
-
-        #     # Публикуем команды для управления моментами
-        #     self.publish_torque_setpoint(roll_torque, pitch_torque, yaw_torque)
-
-        #     # Обнуление углов ориентации
-        #     self.publish_attitude_setpoint(0.0, 0.0, 0.0)
-
-        #     # Обнуляем угловые скорости
-        #     self.publish_rate_setpoint(Vector3(x=0.0, y=0.0, z=0.0))
-
-        #     # Включаем моторы (управление моторами)
-        #     self.set_motor_commands(
-        #         motor_rear_left=1,
-        #         motor_rear_right=0,
-        #         motor_front_left=1,
-        #         motor_front_right=0
-        #     )
-
-        #     # Логируем состояние моторов
-        #     #self.get_logger().info(f"Motors: {self.motors}")
-
-        #     if t - self.stage_time > 0.3:  # ACCELERATE_TIME
-        #         self.flip_stage = FlipStage.ROTATE
-        #         self.stage_time = t
-
-        # elif self.flip_stage == FlipStage.ROTATE:
-        #     self.thrust_target = 0.2  # Уменьшенная тяга для свободного вращения
-        #     self.publish_attitude_setpoint(0.0, 0.0, 0.0)  # Убрать управление углами
-        #     self.publish_torque_setpoint(0.0, 0.0, 0.0)  # Обнуление моментов
-        #     self.publish_rate_setpoint(Vector3(x=0.0, y=0.0, z=0.0))
-        #     self.set_motor_commands(
-        #         motor_rear_left=0, 
-        #         motor_rear_right=0, 
-        #         motor_front_left=0, 
-        #         motor_front_right=0)
-
-        #     up_vector = self.rotate_vector_by_quaternion(Vector3(x=0, y=0, z=-1), self.attitude)
-
-        #     if abs(self.rates.x) > abs(self.max_rate):
-        #         self.max_rate = self.rates.x
-        #         self.acceleration_angle_z = up_vector.z
-        #         self.acceleration_when_rotating_time = t - self.stage_time
-
-        #     if up_vector.z < self.acceleration_angle_z:
-        #         self.flip_stage = FlipStage.BRAKE
-        #         self.stage_time = t
-
-        # elif self.flip_stage == FlipStage.BRAKE:
-        #     self.thrust_target = 0.3  # Установка тяги для торможения
-        #     # Публикация команд для контроля тяги и моментов
-        #     self.publish_attitude_setpoint(0.0, 0.0, 0.0)  # Обнуление углов
-        #     self.publish_rate_setpoint(Vector3(x=0.0, y=0.0, z=0.0))  # Стабилизация угловых скоростей
-        #     self.publish_torque_setpoint(0.0, 0.0, 0.0)  # Обнуление моментов
-        #     # Управление моторами для торможения
-        #     self.set_motor_commands(
-        #         motor_rear_left=0, 
-        #         motor_rear_right=1, 
-        #         motor_front_left=0, 
-        #         motor_front_right=1)
-
-        #     if t - self.stage_time > BRAKE_TIME:  # Проверка времени торможения
-        #         self.flip_stage = FlipStage.POST_BRAKE  # Переход к следующему этапу
-        #         self.stage_time = t  # Обновление времени для следующего этапа
-
-        # elif self.flip_stage == FlipStage.POST_BRAKE:
-        #     self.thrust_target = 0.4
-        #     self.publish_attitude_setpoint(0.0, 0.0, 0.0)  # Обнуление углов
-        #     self.set_motor_commands(
-        #         motor_rear_left=0.3, 
-        #         motor_rear_right=0.3, 
-        #         motor_front_left=0.3, 
-        #         motor_front_right=0.3)
-            
-        #     if t - self.stage_time > self.acceleration_when_rotating_time:
-        #         self.flip_stage = FlipStage.RECOVERY
-        #         self.stage_time = t
-        #         #self.reset_rate_pid()
-        #         self.publish_rate_setpoint(Vector3(x=0.0, y=0.0, z=0.0))
-        #         # rollRatePID.reset()
-		# 	    # pitchRatePID.reset()
-		# 	    # yawRatePID.reset()
-
-        # elif self.flip_stage == FlipStage.RECOVERY:
-        #     # Переводим дрон в стабилизационный режим
-        #     self.set_offboard_control_mode(False)  # Отключаем оффборд-режим и включаем стабилизацию
-        #     self.offboard_is_active = False
-        #     self.set_stabilization_mode()
-        #     self.publish_attitude_setpoint(0.0, 0.0, 0.0)  # Обнуляем углы для стабилизации
-        #     self.publish_rate_setpoint(Vector3(x=0.0, y=0.0, z=0.0))  # Обнуляем углы скорости
-        #     self.publish_thrust_setpoint(0.0)  # Начальная тяга для стабилизации
-
-
-        #     # Увеличиваем тягу в первые 0.4 секунды для стабилизации
-        #     if t - self.stage_time < 0.4:
-        #         self.thrust_target = 0.8
-        #         self.publish_thrust_setpoint(self.thrust_target)  # Отправляем команду для увеличения тяги
-
-        #     # После первых 0.4 секунд можем обновить режим или другие параметры
-        #     if t - self.stage_time > 0.4:
-        #         # Продолжаем обработку дрона, например, переключаемся на следующий этап
-        #         self.flip_stage = FlipStage.LAND
-        #         self.stage_time = t
-        # elif self.flip_stage == FlipStage.LAND:
-        #     self.send_land_command()
+            # После первых 0.4 секунд можем обновить режим или другие параметры
+            if t - self.stage_time > 0.4:
+                # Продолжаем обработку дрона, например, переключаемся на следующий этап
+                self.flip_stage = FlipStage.LAND
+                self.stage_time = t
+        elif self.flip_stage == FlipStage.LAND:
+            self.send_land_command()
 
 
 
