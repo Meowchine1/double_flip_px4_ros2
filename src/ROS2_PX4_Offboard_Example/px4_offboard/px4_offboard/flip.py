@@ -11,7 +11,7 @@ from std_msgs.msg import Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import (
     VehicleTorqueSetpoint, VehicleAngularVelocity, VehicleCommand, VehicleAttitude,
-    HealthReport,BatteryStatus, SensorCombined,
+    HealthReport,BatteryStatus, SensorCombined, VehicleImu,
     OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleAttitudeSetpoint,
     VehicleRatesSetpoint, VehicleLocalPosition, ActuatorMotors
 )
@@ -45,15 +45,6 @@ class FlipStage(Enum):
     FLIPPING = 15
     LANDING = 16
 
-# class EulerAngles:
-#     """
-#     Класс для представления углов Эйлера.
-#     """
-#     def __init__(self, roll, pitch, yaw):
-#         self.roll = roll   # roll
-#         self.pitch = pitch  # pitch
-#         self.yaw = yaw    # yaw
-
 class FlipControlNode(Node):
     def __init__(self):
         super().__init__('flip_control_node')
@@ -61,7 +52,7 @@ class FlipControlNode(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1
+            depth=10
         )
         # Публикации команд 
         self.vehicle_command_publisher = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
@@ -77,6 +68,7 @@ class FlipControlNode(Node):
         self.create_subscription(SensorCombined, '/fmu/out/sensor_combined', self.imu_callback, qos_profile)
         self.create_subscription(VehicleAttitude, '/fmu/out/vehicle_attitude', self.vehicle_attitude_callback, qos_profile) # содержит ориентацию дрона в виде кватерниона
         self.create_subscription(VehicleAngularVelocity, '/fmu/out/vehicle_angular_velocity', self.angular_velocity_callback, qos_profile)
+        self.create_subscription(VehicleImu,'/fmu/in/vehicle_imu',self.acceleration_callback, qos_profile)
         self.create_subscription(ActuatorMotors, '/fmu/out/actuator_controls_0', self.actuator_controls_callback, qos_profile)
         self.create_subscription(HealthReport, '/fmu/out/health_report', self.health_report_callback, qos_profile)
         #self.create_subscription(BatteryStatus, '/fmu/out/battery_status', self.battery_status_callback, qos_profile)
@@ -87,13 +79,13 @@ class FlipControlNode(Node):
         self.vehicle_local_position = VehicleLocalPosition()
         
         #position_callback
-        self.x = 0
-        self.y = 0
-        self.z = 0
-        self.vx = 0
-        self.vy = 0
-        self.vz = 0
-        self.timestamp = 0 
+        # self.x = 0
+        # self.y = 0
+        # self.z = 0
+        # self.vx = 0
+        # self.vy = 0
+        # self.vz = 0
+        # self.timestamp = 0 
 
         self.arming_state = 0  # 0 - не армирован
         self.nav_state = 0  # 0 - начальное состояние
@@ -116,7 +108,6 @@ class FlipControlNode(Node):
         self.delta_q_reset = np.zeros(4, dtype=np.float32)       # Amount by which quaternion has changed during last reset
         
         # angular_velocity_callback
-
         self.angular_velocity = np.zeros(3, dtype=np.float32)
         self.angular_derivative = np.zeros(3, dtype=np.float32)
 
@@ -129,11 +120,11 @@ class FlipControlNode(Node):
         self.create_timer(0.1, self.update)
         self.create_timer(0.1, self.offboard_heartbeat)
 
+        self.imu = 0
+
 
     # Maths functions start
-
     def rotate_vector_by_quaternion(self, vector, quat):
-
         qx, qy, qz, qw = quat.x, quat.y, quat.z, quat.w
         vx, vy, vz = vector.x, vector.y, vector.z
 
@@ -171,34 +162,36 @@ class FlipControlNode(Node):
     #     return EulerAngles(roll, pitch, yaw)
     # Maths functions end
 
-
     # callbacks start
-    def vehicle_attitude_callback(self, msg):
+    def acceleration_callback(self, msg):
+        self.get_logger().info(f'acceleration_callback')
+
+    def vehicle_attitude_callback(self, msg):# YES
+        #self.get_logger().info(f'vehicle_attitude_callback')
         self.quaternion = np.array(msg.q, dtype=np.float32)
         self.delta_q_reset = np.array(msg.delta_q_reset, dtype=np.float32)
         #self.get_logger().info(f' self.delta_q_reset {self.delta_q_reset[0]}  {self.delta_q_reset[1]}  {self.delta_q_reset[2]}  {self.delta_q_reset[3]}')
 
+
     def angular_velocity_callback(self, msg):
-        # """
-        # topic data:
-        #         float32[3] xyz		  # Bias corrected angular velocity about the FRD body frame XYZ-axis in rad/s
-        #         float32[3] xyz_derivative # angular acceleration about the FRD body frame XYZ-axis in rad/s^2
-        # """
-        self.get_logger().info("angular_velocity_callback")
-        self.angular_velocity = np.array(msg.xyz, dtype=np.float32)
-        self.angular_derivative = np.array(msg.xyz_derivative, dtype=np.float32)
-        #self.roll_rate, self.pitch_rate, self.yaw_rate = msg.xyz  # рад/с
-        #self.angular_accel = msg.xyz_derivative  # рад/с²
-        self.get_logger().info(f"angular_velocity_callback={self.angular_velocity[0]}, pitch={self.angular_velocity[1]}, yaw={self.angular_velocity[2]}")
+        #self.get_logger().info(f"Angular velocity: {msg.xyz}")
+        self.get_logger().info('angular_velocity_callback')
+    # def angular_velocity_callback(self, msg):
+    #     self.get_logger().info("angular_velocity_callback")
+    #     self.angular_velocity = np.array(msg.xyz, dtype=np.float32)
+    #     self.angular_derivative = np.array(msg.xyz_derivative, dtype=np.float32)
+    #     self.get_logger().info(f"angular_velocity_callback={self.angular_velocity[0]}, pitch={self.angular_velocity[1]}, yaw={self.angular_velocity[2]}")
 
     def actuator_controls_callback(self, msg):
         """ Управляющие моменты, которые PX4 передает в контроллер двигателя """
+        self.get_logger().info(f'actuator_controls_callback')
         self.torque_roll = msg.control[0]  # момент вокруг оси X (roll)
         self.torque_pitch = msg.control[1]  # момент вокруг оси Y (pitch)
         self.torque_yaw = msg.control[2]  # момент вокруг оси Z (yaw)
         #self.get_logger().info(f"Torques: roll={torque_roll}, pitch={torque_pitch}, yaw={torque_yaw}")
 
     def health_report_callback(self, msg):
+        self.get_logger().info(f'health_report_callback')
         self.health_warning = msg.arming_check_warning
         if self.health_warning:
             self.get_logger().warn("Ошибка в системе здоровья!")
@@ -210,22 +203,27 @@ class FlipControlNode(Node):
     #     self.get_logger().info(f"Батарея: {self.battery_voltage:.2f} В, Заряд: {self.battery_remaining:.2%}")
 
     def trajectory_actual_callback(self, msg):
+        self.get_logger().info(f'trajectory_actual_callback')
         self.current_position = (msg.x, msg.y, msg.z)
-        #self.get_logger().info(f"Текущая цель: x={msg.x}, y={msg.y}, z={msg.z}")
+        self.get_logger().info(f"Текущая цель: x={msg.x}, y={msg.y}, z={msg.z}")
 
-    def vehicle_local_position_callback(self, vehicle_local_position):
+    def vehicle_local_position_callback(self, vehicle_local_position):# YES
+        #self.get_logger().info(f'vehicle_local_position_callback')
         """Callback function for vehicle_local_position topic subscriber."""
         self.vehicle_local_position = vehicle_local_position
 
-    def vehicle_status_callback(self, msg):
+    def vehicle_status_callback(self, msg):# YES
         """Обновляет состояние дрона."""
         #self.get_logger().info('vehicle_status_callback')
         self.vehicle_status = msg
         self.arming_state = msg.arming_state
         self.nav_state = msg.nav_state
 
+
+    # YES
     def imu_callback(self, msg):
-        print()
+        self.imu = msg
+        #self.get_logger().info(f'imu_callback')
         #self.rates = msg
  
     # callbacks ends
@@ -357,7 +355,7 @@ class FlipControlNode(Node):
     # main spinned function
     def update(self):
 
-        self.get_logger().info(f"flip_stage: {self.flip_stage}")
+        #self.get_logger().info(f"flip_stage: {self.flip_stage}")
     
         if self.flip_stage == FlipStage.INIT:
             self.set_offboard_mode()
@@ -376,13 +374,13 @@ class FlipControlNode(Node):
                 self.arm()
 
         elif self.flip_stage == FlipStage.TAKEOFF:
-            self.get_logger().info('FlipStage.TAKEOFF')
+            #self.get_logger().info('FlipStage.TAKEOFF')
             self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)
-            self.get_logger().info(f'self.arming_state {self.arming_state} {self.health_warning}')
-            self.get_logger().info(f"self.vehicle_local_position.z: {self.vehicle_local_position.z} self.takeoff_height: {self.takeoff_height} res:{self.vehicle_local_position.z  + 0.2 <= -self.takeoff_height}") 
+            #self.get_logger().info(f'self.arming_state {self.arming_state} {self.health_warning}')
+            #self.get_logger().info(f"self.vehicle_local_position.z: {self.vehicle_local_position.z} self.takeoff_height: {self.takeoff_height} res:{self.vehicle_local_position.z  + 0.2 <= -self.takeoff_height}") 
             if self.vehicle_local_position.z  - 0.5 <= -self.takeoff_height:
                 self.flip_stage = FlipStage.READY_FOR_FLIP
-                self.get_logger().info('FlipStage.READY_FOR_FLIP')
+                #self.get_logger().info('FlipStage.READY_FOR_FLIP')
 
         elif self.flip_stage == FlipStage.READY_FOR_FLIP:
             euler_angles = self.euler_from_quaternion() # self.toEulerZYX()# wait for ideal conditions
