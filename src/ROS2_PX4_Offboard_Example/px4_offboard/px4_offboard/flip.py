@@ -138,7 +138,7 @@ class FlipControlNode(Node):
         # Таймеры
         self.create_timer(0.1, self.update)
         self.create_timer(0.1, self.offboard_heartbeat)
-        self.create_timer(0.05, self.roll)
+        self.create_timer(0.01, self.roll_func)
         self.roll_on = 0
 
         self.imu = 0
@@ -457,7 +457,7 @@ class FlipControlNode(Node):
 
                 #self.send_velocity(0.0, 0.0, 1.0, 0.0)
 
-    def roll(self):
+    def roll_func(self):
         if self.roll_on:
             if self.alt < 6.0:
                 self.set_thrust(1.0)
