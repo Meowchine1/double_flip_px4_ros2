@@ -2,14 +2,13 @@ import time
 import math
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Quaternion, Vector3
+from geometry_msgs.msg import Quaternion, Vector3, Twist
 from scipy.spatial.transform import Rotation as R
 import tf2_ros
 import tf2_geometry_msgs
 import tf_transformations
 
  
-
 from std_msgs.msg import Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import (
@@ -66,6 +65,8 @@ class FlipControlNode(Node):
         self.vehicle_torque_publisher = self.create_publisher(VehicleTorqueSetpoint, '/fmu/in/vehicle_torque_setpoint', qos_profile)
         self.publisher_rates = self.create_publisher(VehicleRatesSetpoint, '/fmu/in/vehicle_rates_setpoint', 10)
         self.publisher_att = self.create_publisher(VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', 10)
+
+        self.publisher = self.create_publisher(Twist, '/mavros/setpoint_velocity/cmd_vel', 10)
 
         # Подписки на состояние дрона
         self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
@@ -137,6 +138,8 @@ class FlipControlNode(Node):
         # Таймеры
         self.create_timer(0.1, self.update)
         self.create_timer(0.1, self.offboard_heartbeat)
+        self.create_timer(0.05, self.roll)
+        self.roll_on = 0
 
         self.imu = 0
 
@@ -188,7 +191,9 @@ class FlipControlNode(Node):
         self.roll = euler[0] * 180.0 / 3.14159
         self.pitch = euler[1] * 180.0 / 3.14159
         self.alt = msg.position[2]
-        #self.get_logger().info(f"odom_callback {self.roll} {self.pitch} {self.alt}")
+        #self.get_logger().info(f"ODOM_callback {self.roll} {self.pitch} {self.alt}")
+        # if self.odom_callback_on:
+        #     self.get_logger().info(f"ODOM_callback {self.roll} {self.pitch} {self.alt}")
 
     def vehicle_angular_acceleration_setpoint_callback(self, msg):
         #self.get_logger().info(f'vehicle_angular_acceleration_setpoint_callback')
@@ -425,13 +430,21 @@ class FlipControlNode(Node):
             self.set_thrust(0.6)
             time.sleep(0.01)
 
+
+    def send_velocity(self, linear_x, linear_y, linear_z, angular_z):
+        twist = Twist()
+        twist.linear.x = linear_x
+        twist.linear.y = linear_y
+        twist.linear.z = linear_z
+        twist.angular.z = angular_z
+        self.publisher.publish(twist)
     # send functions end
 
 
     """ Дрон должен постоянно получать это сообщение чтобы оставаться в offboard """
     def offboard_heartbeat(self):
          if self.offboard_is_active:
-                #self.get_logger().info("Sending SET_MODE OFFBOARD") 
+                self.get_logger().info("Sending SET_MODE OFFBOARD") 
                 """Publish the offboard control mode."""
                 msg = OffboardControlMode()
                 msg.position = True
@@ -442,9 +455,19 @@ class FlipControlNode(Node):
                 msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
                 self.offboard_control_mode_publisher.publish(msg)
 
+                #self.send_velocity(0.0, 0.0, 1.0, 0.0)
+
+    def roll(self):
+        if self.roll_on:
+            if self.alt < 6.0:
+                self.set_thrust(1.0)
+                self.get_logger().info(f"self.set_thrust(1.0) self.alt={self.alt}")
+
+
     # main spinned function
     def update(self):
         #self.get_logger().info(f"flip_stage: {self.flip_stage}")
+        self.get_logger().info(f"UPDATE self.alt={self.alt}  self.vehicle_local_position.z={self.vehicle_local_position.z}")
         if self.flip_stage == FlipStage.INIT:
             self.set_offboard_mode()
             self.arm()
@@ -478,11 +501,12 @@ class FlipControlNode(Node):
                     self.flip_stage = FlipStage.BOUNCE
                     self.stage_time =  time.time()
 
-        ## Первый флип назад
+        ## Первый флип 
         elif self.flip_stage == FlipStage.BOUNCE:
             #publish_rate_setpoint(self, roll_rate=0, pitch_rate=6.0, yaw_rate=0)
-            self.get_logger().info("flip")
-            self.flip_roll()
+            self.get_logger().info("flip") 
+            #self.flip_roll() 
+            self.roll_on = 1
 
             #publish_torque_setpoint(roll_torque=0.3, pitch_torque=0.3, yaw_torque=0.0)
         #     #euler = self.euler_from_quaternion()
