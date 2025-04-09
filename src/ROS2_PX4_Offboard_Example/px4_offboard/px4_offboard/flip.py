@@ -28,24 +28,28 @@ ARM_TIMEOUT = 5.0
 OFFBOARD_TIMEOUT = 5.0
 
 # Перечисление состояний
-class FlipStage(Enum):
+class DroneState(Enum):
+    INIT = 7
     DISARMED = 0
     ARMING = 1
     ARMED = 2
     OFFBOARD = 3
     TAKEOFF = 4
     WAIT = 5
-    BOUNCE = 6
-    ACCELERATE = 7
-    ROTATE = 8
-    BRAKE = 9
-    POST_BRAKE = 10
-    RECOVERY = 11
-    LAND = 12
-    INIT = 13
-    READY_FOR_FLIP = 14
-    FLIPPING = 15
+    FLIP = 6
+    READY_FOR_FLIP = 8
     LANDING = 16
+
+class DroneFlipState(Enum):
+    INIT = 0
+    FLIP_INIT = 7
+    FLIP_TURNED_315 = 1
+    FLIP_TURNED_45 = 2
+    BRAKE = 3
+    POST_BRAKE = 4
+    RECOVERY = 5
+    LAND = 6
+    FLIPPING = 9
 
 class FlipControlNode(Node):
     def __init__(self):
@@ -98,7 +102,12 @@ class FlipControlNode(Node):
         self.battery_remaining = 0.0  # начальный уровень заряда
         self.current_position = (0.0, 0.0, 0.0)  # начальная позиция (x, y, z)
 
-        self.flip_stage = FlipStage.INIT
+
+        # STATE
+        self.main_state = DroneState.INIT
+        self.flip_state = DroneFlipState.INIT
+
+
         self.stage_time = time.time()
         self.takeoff_height = 5.0
         self.offboard_is_active = False
@@ -135,13 +144,20 @@ class FlipControlNode(Node):
         self.delta_angle_dt = 0        # integration period in microseconds
         self.delta_velocity_dt = 0       # integration period in microseconds
 
+        self.imu = 0
+
         # Таймеры
         self.create_timer(0.1, self.update)
         self.create_timer(0.1, self.offboard_heartbeat)
-        self.create_timer(0.01, self.roll_func)
-        self.roll_on = 0
+        self.create_timer(0.01, self.flip_thrust_max) 
+        self.create_timer(0.01, self.flip_thrust_recovery) 
+        self.create_timer(0.01, self.flip_pitch)
+        # Timer flags
+        self.flip_thrust_max_f = False
+        self.flip_thrust_recovery_f = False
+        self.flip_pitch_f = False
 
-        self.imu = 0
+         
 
 
     # Maths functions start
@@ -168,19 +184,6 @@ class FlipControlNode(Node):
         r = R.from_quat([self.quaternion[0], self.quaternion[1], self.quaternion[2], self.quaternion[3]])
         return r.as_euler('xyz')
 
-    # def toEulerZYX(self):
-    #     """
-    #     Преобразует кватернион в углы Эйлера (roll, pitch, yaw).
-        
-    #     :return: Объект EulerAngles с аттрибутами roll, pitch, yaw
-    #     """
-    #     if self.quaternion is None:
-    #         return None  # Если кватернион не задан
-        
-    #     q = [self.quaternion.x, self.quaternion.y, self.quaternion.z, self.quaternion.w]
-    #     roll, pitch, yaw = tf_transformations.euler_from_quaternion(q)
-
-    #     return EulerAngles(roll, pitch, yaw)
     # Maths functions end
 
     # callbacks start
@@ -290,7 +293,7 @@ class FlipControlNode(Node):
         trajectory_msg.position = [x, y, -z]
         trajectory_msg.timestamp = int(time.time() * 1e6)
         self.trajectory_setpoint_publisher.publish(trajectory_msg)
-        self.get_logger().info(f'publish_position_setpoint')
+        #self.get_logger().info(f'publish_position_setpoint')
 
     def publish_rate_setpoint(self, roll_rate, pitch_rate, yaw_rate):
         rate_msg = VehicleRatesSetpoint()
@@ -365,7 +368,7 @@ class FlipControlNode(Node):
     def set_offboard_mode(self):
         """Switch to offboard mode."""
         self.offboard_is_active = True
-        self.get_logger().info(f'set_offboard_mode')
+        #self.get_logger().info(f'set_offboard_mode')
         # self.publish_vehicle_command(
         #     VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
         # self.get_logger().info("Switching to offboard mode")
@@ -444,7 +447,7 @@ class FlipControlNode(Node):
     """ Дрон должен постоянно получать это сообщение чтобы оставаться в offboard """
     def offboard_heartbeat(self):
          if self.offboard_is_active:
-                self.get_logger().info("Sending SET_MODE OFFBOARD") 
+                #self.get_logger().info("Sending SET_MODE OFFBOARD") 
                 """Publish the offboard control mode."""
                 msg = OffboardControlMode()
                 msg.position = True
@@ -457,57 +460,90 @@ class FlipControlNode(Node):
 
                 #self.send_velocity(0.0, 0.0, 1.0, 0.0)
 
-    def roll_func(self):
-        if self.roll_on:
-            if self.alt < 6.0:
-                self.set_thrust(1.0)
-                self.get_logger().info(f"self.set_thrust(1.0) self.alt={self.alt}")
+    # def roll_thrust_max(self):
+    #     if self.roll_on:
+    #         if self.alt < 6.0:
+    #             self.set_thrust(1.0)
+    #             self.get_logger().info(f"self.set_thrust(1.0) self.alt={self.alt}")
+
+    def flip_thrust_max(self):
+        if self.flip_thrust_max_f:
+            self.set_thrust(1.0)
+            self.get_logger().info(f"flip_thrust_max")
+
+    def flip_thrust_recovery(self):
+        if self.flip_thrust_recovery_f:
+            self.set_thrust(0.6)
+            #self.get_logger().info(f"flip_thrust_recovery")
+
+    def flip_pitch(self):
+        if self.flip_pitch_f:
+            self.set_rates(360.0, 0.0, 0.0, 0.25)
+            #self.get_logger().info(f"flip_pitch")
 
 
     # main spinned function
     def update(self):
         #self.get_logger().info(f"flip_stage: {self.flip_stage}")
-        self.get_logger().info(f"UPDATE self.alt={self.alt}  self.vehicle_local_position.z={self.vehicle_local_position.z}")
-        if self.flip_stage == FlipStage.INIT:
+        #self.get_logger().info(f"UPDATE self.alt={self.alt}  self.vehicle_local_position.z={self.vehicle_local_position.z}")
+        if self.main_state == DroneState.INIT:
             self.set_offboard_mode()
             self.arm()
-            self.flip_stage = FlipStage.ARMING 
+            self.main_state = DroneState.ARMING 
          
-        elif self.flip_stage == FlipStage.ARMING:
-            #self.get_logger().info('FlipStage.ARMING')
+        elif self.main_state == DroneState.ARMING:
             self.get_logger().warn(f"arm_state: {self.arming_state}")
             self.get_logger().info(f"nav_state: {self.nav_state}")
             if self.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self.get_logger().info('ARMING_STATE_ARMED')
-                self.flip_stage = FlipStage.TAKEOFF
+                self.main_state = DroneState.TAKEOFF
             else:
                 self.set_offboard_mode()
                 self.arm()
 
-        elif self.flip_stage == FlipStage.TAKEOFF:
-            #self.get_logger().info('FlipStage.TAKEOFF')
+        elif self.main_state == DroneState.TAKEOFF:
             self.publish_position_setpoint(0.0, 0.0, self.takeoff_height)
             #self.get_logger().info(f'self.arming_state {self.arming_state} {self.health_warning}')
-            self.get_logger().info(f"position.z: {self.vehicle_local_position.z} self.takeoff_height: {self.takeoff_height} res:{self.vehicle_local_position.z  + 0.2 <= -self.takeoff_height}") 
+            #self.get_logger().info(f"position.z: {self.vehicle_local_position.z} self.takeoff_height: {self.takeoff_height} res:{self.vehicle_local_position.z  + 0.2 <= -self.takeoff_height}") 
             if self.vehicle_local_position.z  - 0.5 <= -self.takeoff_height:
-                self.flip_stage = FlipStage.READY_FOR_FLIP
-                #self.get_logger().info('FlipStage.READY_FOR_FLIP')
+                self.main_state = DroneState.READY_FOR_FLIP
 
-        elif self.flip_stage == FlipStage.READY_FOR_FLIP:
-            #euler_angles = self.euler#tf_transformations.euler_from_quaternion()#self.euler_from_quaternion() # self.toEulerZYX()# wait for ideal conditions
-            self.get_logger().info(f'self.roll angular_velocity={self.angular_velocity[0]} abs(self.roll={abs(self.roll)}')
+        elif self.main_state == DroneState.READY_FOR_FLIP:
+            #self.get_logger().info(f'self.roll angular_velocity={self.angular_velocity[0]} abs(self.roll={abs(self.roll)}')
             if self.roll is not None:
                 if (abs(self.angular_velocity[0]) < 0.05 and (abs(self.roll) < 2.0)):
-                    self.flip_stage = FlipStage.BOUNCE
+                    self.main_state = DroneState.FLIP
                     self.stage_time =  time.time()
 
-        ## Первый флип 
-        elif self.flip_stage == FlipStage.BOUNCE:
-            #publish_rate_setpoint(self, roll_rate=0, pitch_rate=6.0, yaw_rate=0)
-            self.get_logger().info("flip") 
-            #self.flip_roll() 
-            self.roll_on = 1
-
+        ## PITCH FLIP
+        elif self.main_state == DroneState.FLIP:
+            self.flip_pitch_f = True
+            #self.get_logger().info(f"FLIP self.roll={self.roll} self.alt={self.alt}  self.alt < 6.0={self.alt > -6.0} self.flip_thrust_max_f={self.flip_thrust_max_f} self.flip_pitch_f {self.flip_pitch_f} self.flip_pitch_f={self.flip_pitch_f} self.flip_state={self.flip_state}")
+            # if self.flip_state == DroneFlipState.INIT:
+            #     if self.alt > -6.0:                  # 1) Jump
+            #         self.flip_thrust_max_f = True      #turns on  flip_thrust_max function
+            #     else:
+            #         self.flip_thrust_max_f = False
+            #         self.flip_pitch_f = True           #2) Rotate. Turns on flip_pitch function
+            #         self.flip_state = DroneFlipState.FLIP_INIT
+            
+            # elif self.flip_state != DroneFlipState.FLIP_TURNED_315:
+            #     self.get_logger().info(f" self.roll={self.roll} self.flip_state == DroneFlipState.FLIP_INIT and self.roll={self.flip_state == DroneFlipState.FLIP_INIT and self.roll}")
+            #     if self.flip_state == DroneFlipState.FLIP_INIT and self.roll > 45.0:
+            #         self.flip_state = DroneFlipState.FLIP_TURNED_45
+            #     elif self.flip_state == DroneFlipState.FLIP_TURNED_45 and -45.0 < self.roll < 0.0:
+            #         self.flip_state = DroneFlipState.FLIP_TURNED_315
+            #         self.flip_pitch_f = False
+            # elif abs(self.roll) > 3.0:
+            #         self.flip_thrust_recovery_f = True
+            # else:
+            #     self.flip_thrust_recovery_f = False
+            #     self.main_state = DroneState.LANDING
+            
+                
+        elif self.main_state == DroneState.LANDING:
+            self.send_land_command()
+            #self.disarm()    
             #publish_torque_setpoint(roll_torque=0.3, pitch_torque=0.3, yaw_torque=0.0)
         #     #euler = self.euler_from_quaternion()
         #     self.publish_attitude_setpoint(roll=0.0, pitch=0.0, yaw=self.euler_from_quaternion()[2], thrust=0.8)  # Управление ориентацией, отправляется и self.thrust_target
