@@ -103,6 +103,7 @@ class FlipControlNode(Node):
 
         self.stage_time = time.time()
         self.takeoff_height = 5.0
+        self.flip_height =-7.0
         self.offboard_is_active = False
 
         self.thrust_target = 0.0
@@ -143,6 +144,7 @@ class FlipControlNode(Node):
         # Accumulators
         self.roll_accum = 0.0
         self.prev_roll = 0.0
+        self.flip_count = 0
 
         # Таймеры
         self.create_timer(0.1, self.update)
@@ -403,12 +405,13 @@ class FlipControlNode(Node):
 
     def flip_pitch_t(self):
         if self.flip_pitch_f:
-            self.set_rates(17.0, 0.0, 0.0, 0.25)# roll_max_rate should be 1000 in QGC vechicle setup
+            #self.set_rates(17.0, 0.0, 0.0, 0.25)# roll_max_rate should be 1000 in QGC vechicle setup
+            self.set_rates(25.0, 0.0, 0.0, 0.25)
 
 
     # main spinned function
     def update(self):
-        #self.get_logger().info(f"flip_stage: {self.flip_stage}")
+        self.get_logger().info(f"self.main_state={self.main_state}  self.flip_state={self.flip_state}")
         #self.get_logger().info(f"UPDATE self.alt={self.alt}  self.vehicle_local_position.z={self.vehicle_local_position.z}")
         if self.main_state == DroneState.INIT:
             self.set_offboard_mode()
@@ -452,11 +455,11 @@ class FlipControlNode(Node):
             self.prev_roll = self.roll
 
             self.get_logger().info(
-                f"[FLIP] roll={self.roll:.2f}, roll_diff{roll_diff}, roll_accum={self.roll_accum:.2f}, alt={self.alt:.2f}, flip_state={self.flip_state.name}")
+                f"[FLIP] roll={self.roll:.2f}, self.flip_count={self.flip_count}, roll_diff={roll_diff}, roll_accum={self.roll_accum:.2f}, alt={self.alt:.2f}, flip_state={self.flip_state.name}")
 
             # 1) Взлёт на высоту
             if self.flip_state == DroneFlipState.INIT:
-                if self.alt > -6.0:
+                if self.alt > self.flip_height:
                     self.flip_thrust_max_f = True
                 else:
                     self.flip_thrust_max_f = False
@@ -473,17 +476,30 @@ class FlipControlNode(Node):
                 self.flip_state = DroneFlipState.FLIP_TURNED_315
                 self.flip_pitch_f = False
 
-            # 3) Восстановление после переворота
+            # 3) Если первый флип завершён, начинаем второй флип (повторяем состояния)
+            elif self.flip_state == DroneFlipState.FLIP_TURNED_315 and self.roll_accum > 360.0:
+                # Второй флип — сбросим состояние и начнём снова отслеживать углы
+                self.flip_count += 1  # Увеличиваем счетчик флипов
+                if self.flip_count < 2:  # Проверяем, если это первый флип, то повторяем
+                    self.flip_state = DroneFlipState.FLIP_INIT  # Сброс состояния для второго флипа
+                    self.roll_accum = 0.0  # Сброс накопленного угла для второго флипа
+                else:  # После второго флипа — выход в landing
+                    self.flip_state = DroneFlipState.LANDING
+                    self.main_state = DroneState.LANDING  # Переход в состояние посадки
+
+            # 4) Восстановление после флипа
             elif self.flip_state == DroneFlipState.FLIP_TURNED_315:
-                if abs(self.alt) < 5.0:
+                if self.alt < 5.0:
                     self.flip_thrust_recovery_f = True
                 else:
                     self.flip_thrust_recovery_f = False
                     self.main_state = DroneState.LANDING
+                    self.flip_count = 0
             
                 
         elif self.main_state == DroneState.LANDING:
-            self.send_land_command()
+            self.publish_position_setpoint(0.0, 0.0, 1.0)
+            #self.send_land_command()
             #self.disarm()    
             #publish_torque_setpoint(roll_torque=0.3, pitch_torque=0.3, yaw_torque=0.0)
         #     #euler = self.euler_from_quaternion()
