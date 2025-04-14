@@ -2,7 +2,7 @@ import time
 import math
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Quaternion, Vector3, Twist
+from geometry_msgs.msg import Quaternion, Vector3, Twist, PoseStamped
 from scipy.spatial.transform import Rotation as R
 import tf2_ros
 import tf2_geometry_msgs
@@ -13,9 +13,9 @@ from std_msgs.msg import Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from px4_msgs.msg import (
     VehicleTorqueSetpoint, VehicleAngularVelocity, VehicleCommand, VehicleAttitude,
-    HealthReport,BatteryStatus, SensorCombined, VehicleImu, VehicleOdometry,
-    OffboardControlMode, TrajectorySetpoint, VehicleStatus, VehicleAttitudeSetpoint,
-    VehicleRatesSetpoint, VehicleLocalPosition, ActuatorMotors, VehicleAngularAccelerationSetpoint
+    SensorCombined, VehicleImu, VehicleOdometry, OffboardControlMode, TrajectorySetpoint, 
+    VehicleStatus, VehicleAttitudeSetpoint, VehicleRatesSetpoint, VehicleLocalPosition, 
+    ActuatorMotors, VehicleAngularAccelerationSetpoint
 )
 import numpy as np
 from enum import Enum 
@@ -82,6 +82,11 @@ class FlipControlNode(Node):
         '/fmu/out/vehicle_angular_acceleration_setpoint', self.vehicle_angular_acceleration_setpoint_callback, qos_profile)
  
         self.create_subscription(VehicleOdometry, '/fmu/out/vehicle_odometry', self.odom_callback, qos_profile)
+
+        self.create_subscription(PoseStamped,'/quad/pose_pred',self.pose_callback, qos_profile)
+
+        
+
         self.pitch = 0.0
         self.roll = 0.0
         self.alt = 0.0
@@ -185,6 +190,32 @@ class FlipControlNode(Node):
     # Maths functions end
 
     # callbacks start
+
+    def pose_callback(self, msg):
+        # Извлекаем позицию
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        z = msg.pose.position.z
+
+        # Извлекаем кватернион
+        qx = msg.pose.orientation.x
+        qy = msg.pose.orientation.y
+        qz = msg.pose.orientation.z
+        qw = msg.pose.orientation.w
+        self.get_logger().info(f"pose_callback {x} {y} {z} {qx} {qy} {qz}")
+
+        # # Преобразуем кватернион в углы Эйлера (roll, pitch, yaw)
+        # roll, pitch, yaw = euler_from_quaternion([qx, qy, qz, qw])
+
+        # # Логируем данные
+        # self.get_logger().info(f'Position - x: {x}, y: {y}, z: {z}')
+        # self.get_logger().info(f'Orientation (Euler angles) - roll: {roll}, pitch: {pitch}, yaw: {yaw}')
+
+        # # Пример преобразования углов в градусы, если нужно
+        # roll_deg = radians(roll)
+        # pitch_deg = radians(pitch)
+        # yaw_deg = radians(yaw)
+        # self.get_logger().info(f'Orientation in degrees - roll: {roll_deg}, pitch: {pitch_deg}, yaw: {yaw_deg}')
 
     def odom_callback(self, msg):
         q = msg.q  # quaternion [w, x, y, z]
