@@ -5,10 +5,16 @@ from std_msgs.msg import Float32MultiArray
 from px4_msgs.msg import VehicleAttitude, ActuatorOutputs, VehicleLocalPosition
 import numpy as np
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from scipy.spatial.transform import Rotation as R
+
+
 
 class DynamicModelNode(Node):
     def __init__(self):
         super().__init__('dynamic_model_node')
+        
+        self.get_logger().info(f"DynamicModelNode")
+
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -27,7 +33,7 @@ class DynamicModelNode(Node):
         self.drag = 0.1
         self.max_rate = 25.0  # рад/с, ограничение на угловую скорость (roll/pitch)
 
-        self.state = np.zeros(12)  # [x, y, z, vx, vy, vz, roll, pitch, yaw, wx, wy, wz]
+        self.state = np.zeros(12, dtype=float)  # [x, y, z, vx, vy, vz, roll, pitch, yaw, wx, wy, wz]
         self.motor_speeds = np.zeros(4)
         self.orientation_q = [0.0, 0.0, 0.0, 1.0]
 
@@ -50,7 +56,7 @@ class DynamicModelNode(Node):
         self.motor_speeds = np.clip((np.array(pwm_outputs) - 1000.0) / 1000.0 * self.max_speed, 0.0, self.max_speed)
 
     def vehicle_attitude_callback(self, msg):
-        self.orientation_q = [msg.q[0], msg.q[1], msg.q[2], msg.q[3]]
+        self.orientation_q = list(map(float, msg.q))
         # Преобразуем кватернион в углы Эйлера
         rotation = R.from_quat(self.orientation_q)
         euler_angles = rotation.as_euler('xyz', degrees=False)
@@ -66,6 +72,8 @@ class DynamicModelNode(Node):
         self.state[3:6] = [msg.vx, msg.vy, msg.vz]
 
     def step_dynamics(self):
+        #self.get_logger().info(f"step_dynamics")
+
         dt = 0.01
         vel = self.state[3:6]
         ang_vel = self.state[9:12]
@@ -96,6 +104,7 @@ class DynamicModelNode(Node):
 
         self.publish_pose()
         self.publish_motor_speeds()
+        
 
     def publish_pose(self):
         msg = PoseStamped()

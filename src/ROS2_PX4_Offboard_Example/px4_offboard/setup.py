@@ -32,11 +32,9 @@ setup(
                 'offboard_control = px4_offboard.offboard_control:main',
                 'offboard_control_example = px4_offboard.offboard_control_example:main',
                 'visualizer = px4_offboard.visualizer:main',
-                'velocity_control = px4_offboard.velocity_control:main',
-                'control = px4_offboard.control:main',
                 'processes = px4_offboard.processes:main',
-                'base = px4_offboard.base:main' ,
-                'flip = px4_offboard.flip:main'
+                'flip = px4_offboard.flip:main',
+                'drone_dynamics = px4_offboard.drone_dynamics:main'
                  
         ],  #'double_flip = px4_offboard.double_flip:main'
     },

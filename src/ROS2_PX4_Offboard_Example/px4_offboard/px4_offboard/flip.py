@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation as R
 import tf2_ros
 import tf2_geometry_msgs
 import tf_transformations
-
+from math import degrees
  
 from std_msgs.msg import Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -182,7 +182,7 @@ class FlipControlNode(Node):
         r = R.from_euler('xyz', [roll, pitch, yaw])
         return np.array(r.as_quat(), dtype=np.float32)  # Убедимся, что это numpy.float32
     
-    def euler_from_quaternion(self):
+    def euler_from_self_quaternion(self):
         """Преобразование кватерниона в углы Эйлера (возвращает roll, pitch, yaw)."""
         r = R.from_quat([self.quaternion[0], self.quaternion[1], self.quaternion[2], self.quaternion[3]])
         return r.as_euler('xyz')
@@ -202,20 +202,20 @@ class FlipControlNode(Node):
         qy = msg.pose.orientation.y
         qz = msg.pose.orientation.z
         qw = msg.pose.orientation.w
-        self.get_logger().info(f"pose_callback {x} {y} {z} {qx} {qy} {qz}")
+        #self.get_logger().info(f"pose_callback {x} {y} {z} {qx} {qy} {qz}")
 
-        # # Преобразуем кватернион в углы Эйлера (roll, pitch, yaw)
-        # roll, pitch, yaw = euler_from_quaternion([qx, qy, qz, qw])
+        # Преобразуем кватернион в углы Эйлера (roll, pitch, yaw)
+        roll, pitch, yaw = tf_transformations.euler_from_quaternion([qx, qy, qz, qw])
 
-        # # Логируем данные
-        # self.get_logger().info(f'Position - x: {x}, y: {y}, z: {z}')
-        # self.get_logger().info(f'Orientation (Euler angles) - roll: {roll}, pitch: {pitch}, yaw: {yaw}')
+        # Логируем данные
+        self.get_logger().info(f'Position - x: {x}, y: {y}, z: {z}')
+        self.get_logger().info(f'Orientation (Euler angles) - roll: {roll}, pitch: {pitch}, yaw: {yaw}')
 
-        # # Пример преобразования углов в градусы, если нужно
-        # roll_deg = radians(roll)
-        # pitch_deg = radians(pitch)
-        # yaw_deg = radians(yaw)
-        # self.get_logger().info(f'Orientation in degrees - roll: {roll_deg}, pitch: {pitch_deg}, yaw: {yaw_deg}')
+        # Пример преобразования углов в градусы, если нужно
+        roll_deg = degrees(roll)
+        pitch_deg = degrees(pitch)
+        yaw_deg = degrees(yaw)
+        self.get_logger().info(f'Orientation in degrees - roll: {roll_deg}, pitch: {pitch_deg}, yaw: {yaw_deg}')
 
     def odom_callback(self, msg):
         q = msg.q  # quaternion [w, x, y, z]
@@ -442,7 +442,7 @@ class FlipControlNode(Node):
 
     # main spinned function
     def update(self):
-        self.get_logger().info(f"self.main_state={self.main_state}  self.flip_state={self.flip_state}")
+        #self.get_logger().info(f"self.main_state={self.main_state}  self.flip_state={self.flip_state}")
         #self.get_logger().info(f"UPDATE self.alt={self.alt}  self.vehicle_local_position.z={self.vehicle_local_position.z}")
         if self.main_state == DroneState.INIT:
             self.set_offboard_mode()

@@ -60,40 +60,19 @@ def generate_launch_description():
             name='processes',
             prefix='gnome-terminal --'
         ),
-        # Node(
-        #     package='px4_offboard',
-        #     namespace='px4_offboard',
-        #     executable='control',
-        #     name='control',
-        #     prefix='gnome-terminal --',
-        # ),
-        # Node(
-        #     package='px4_offboard',
-        #     namespace='px4_offboard',
-        #     executable='velocity_control',
-        #     name='velocity'
-        # ),
-
-        #original
-        #  Node(
-        #     package='px4_offboard',
-        #     namespace='px4_offboard',
-        #     executable='offboard_control_example',
-        #     name='offboard_control_example'
-        # ),
-
-        #second version
-        # Node(
-        #     package='px4_offboard',
-        #     namespace='px4_offboard',
-        #     executable='base',
-        #     name='base', 
-        # ),
+        
         Node(
             package='px4_offboard',
             namespace='px4_offboard',
             executable='flip',
             name='flip', 
+        ),
+
+        Node(
+            package='px4_offboard',
+            namespace='px4_offboard',
+            executable='drone_dynamics',
+            name='drone_dynamics', 
         ),
         
         Node(
