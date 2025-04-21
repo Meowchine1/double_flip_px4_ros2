@@ -15,7 +15,9 @@ from px4_msgs.msg import (
     ActuatorMotors, VehicleAngularAccelerationSetpoint
 )
 import numpy as np
-from enum import Enum 
+from enum import Enum
+
+from px4_offboard.mpc_controller import MPCController
 
 BOUNCE_TIME = 0.6
 ACCELERATE_TIME = 0.07
@@ -72,25 +74,13 @@ class FlipControlNode(Node):
         self.create_subscription(VehicleAttitude, '/fmu/out/vehicle_attitude', self.vehicle_attitude_callback, qos_profile)
         self.create_subscription(VehicleAngularAccelerationSetpoint,
         '/fmu/out/vehicle_angular_acceleration_setpoint', self.vehicle_angular_acceleration_setpoint_callback, qos_profile)
-
         self.create_subscription(VehicleImu,'/fmu/in/vehicle_imu',self.vehicle_imu_callback, qos_profile)
-
         self.create_subscription(VehicleOdometry, '/fmu/out/vehicle_odometry', self.odom_callback, qos_profile)
-
-         
-
         self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
-
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
-         
-         
-         
-         
         self.create_subscription(ActuatorMotors, '/fmu/out/actuator_motors', self.actuator_motors_callback, qos_profile)
         self.create_subscription(TrajectorySetpoint, '/fmu/out/trajectory_setpoint', self.trajectory_setpoint_callback, qos_profile)
          
-         
-        
         # drone_dynamics node topic
         self.create_subscription(PoseStamped,'/quad/pose_pred',self.pose_callback, qos_profile)
 
@@ -139,7 +129,6 @@ class FlipControlNode(Node):
 
         self.delta_angle_dt = 0.0       # integration period in microseconds
         self.delta_velocity_dt = 0.0    # integration period in microseconds
-
 
         #sensor_combined_callback
         self.q = np.array([0.0, 0.0, 0.0, 1.0])  # Начальная ориентация (кватернион, идентичность)
@@ -229,9 +218,6 @@ class FlipControlNode(Node):
         self.vehicleImu_angular_velocity = self.vehicleImu_delta_angle / delta_angle_dt
 
     # ===================== 
-
-
-
     def pose_callback(self, msg):
         # Извлекаем позицию
         x = msg.pose.position.x
@@ -266,10 +252,6 @@ class FlipControlNode(Node):
         self.alt = msg.position[2]
         #self.get_logger().info(f"ODOM_callback {self.roll} {self.pitch} {self.alt}")
 
-     
-
-     
-
 
     def actuator_motors_callback(self, msg):
         """ Управляющие моменты, которые PX4 передает в контроллер двигателя """
@@ -295,16 +277,6 @@ class FlipControlNode(Node):
         #self.get_logger().info('vehicle_status_callback')
         self.vehicle_status = msg
         self.arming_state = msg.arming_state
-        self.nav_state = msg.nav_state
- 
-
-    """ из топика sensor_combined получаем:
-            угловую скорость (omega)
-            угол поворота по каждой оси θ
-            приращение ориентации dq
-            новая ориентация q_new
-            линейное ускорение (в м/с²)"""
-     
  
     # callbacks ends
 
@@ -441,6 +413,20 @@ class FlipControlNode(Node):
         self.publisher.publish(twist)
     # send functions end
 
+    def get_current_state(self):
+        #  OR return self.droneDynamics_state # метод, возвращающий [pos, vel, q, omega]
+        pos = self.droneDynamics_IMU_loc_data# TODO
+        vel = self.droneDynamics_velocity# TODO
+        q = self.droneDynamics_attitude# TODO
+        omega = self.droneDynamics_angular_velocity# TODO
+        return np.concatenate([pos, vel, q, omega])
+    
+    def send_motor_commands(self, motor_inputs):
+        # нормализованные значения [0,1] — переводим в pwm/thrust команды
+        msg = ActuatorMotors()
+        msg.control = list(np.clip(motor_inputs, 0.0, 1.0))
+        self.motor_pub.publish(msg)
+
     """ Дрон должен постоянно получать это сообщение чтобы оставаться в offboard """
     def offboard_heartbeat(self):
          if self.offboard_is_active:
@@ -467,7 +453,6 @@ class FlipControlNode(Node):
         if self.flip_pitch_f:
             #self.set_rates(17.0, 0.0, 0.0, 0.25)# roll_max_rate should be 1000 in QGC vechicle setup
             self.set_rates(25.0, 0.0, 0.0, 0.25)
-
 
     # main spinned function
     def update(self):
@@ -504,57 +489,65 @@ class FlipControlNode(Node):
 
         ## PITCH FLIP
         elif self.main_state == DroneState.FLIP:
+            target_pos = np.array([0.0, 0.0, FLIP_HEIGHT])
+            target_q = R.from_euler('xyz', [np.pi, 0, 0]).as_quat()  # 180° roll
+
+            current_state = self.get_current_state()  # метод, возвращающий [pos, vel, q, omega]
+             
+            optimal_motor_inputs = self.mpc.solve(current_state, target_pos, target_q) # Вычисление оптимального управляющего воздействия
+             
+            self.send_motor_commands(optimal_motor_inputs)
             # Обновление накопленного roll с учётом wrap-around
-            roll_diff = self.roll - self.prev_roll
-            if roll_diff > 180.0:
-                roll_diff -= 360.0
-            elif roll_diff < -180.0:
-                roll_diff += 360.0
+            # roll_diff = self.roll - self.prev_roll
+            # if roll_diff > 180.0:
+            #     roll_diff -= 360.0
+            # elif roll_diff < -180.0:
+            #     roll_diff += 360.0
 
-            self.roll_accum += roll_diff
-            self.prev_roll = self.roll
+            # self.roll_accum += roll_diff
+            # self.prev_roll = self.roll
 
-            self.get_logger().info(
-                f"[FLIP] roll={self.roll:.2f}, self.flip_count={self.flip_count}, roll_diff={roll_diff}, roll_accum={self.roll_accum:.2f}, alt={self.alt:.2f}, flip_state={self.flip_state.name}")
+            # self.get_logger().info(
+            #     f"[FLIP] roll={self.roll:.2f}, self.flip_count={self.flip_count}, roll_diff={roll_diff}, roll_accum={self.roll_accum:.2f}, alt={self.alt:.2f}, flip_state={self.flip_state.name}")
 
-            # 1) Взлёт на высоту
-            if self.flip_state == DroneFlipState.INIT:
-                if self.alt - 0.5 <= FLIP_HEIGHT:
-                    self.flip_thrust_max_f = True
-                else:
-                    self.flip_thrust_max_f = False
-                    self.flip_pitch_f = True
-                    self.roll_accum = 0.0  # сброс перед началом вращения
-                    self.prev_roll = self.roll
-                    self.flip_state = DroneFlipState.FLIP_INIT
+            # # 1) Взлёт на высоту
+            # if self.flip_state == DroneFlipState.INIT:
+            #     if self.alt - 0.5 <= FLIP_HEIGHT:
+            #         self.flip_thrust_max_f = True
+            #     else:
+            #         self.flip_thrust_max_f = False
+            #         self.flip_pitch_f = True
+            #         self.roll_accum = 0.0  # сброс перед началом вращения
+            #         self.prev_roll = self.roll
+            #         self.flip_state = DroneFlipState.FLIP_INIT
 
-            # 2) Отслеживание прогресса флипа
-            elif self.flip_state == DroneFlipState.FLIP_INIT and self.roll_accum > 45.0:
-                self.flip_state = DroneFlipState.FLIP_TURNED_45
+            # # 2) Отслеживание прогресса флипа
+            # elif self.flip_state == DroneFlipState.FLIP_INIT and self.roll_accum > 45.0:
+            #     self.flip_state = DroneFlipState.FLIP_TURNED_45
 
-            elif self.flip_state == DroneFlipState.FLIP_TURNED_45 and self.roll_accum > 315.0:
-                self.flip_state = DroneFlipState.FLIP_TURNED_315
-                self.flip_pitch_f = False
+            # elif self.flip_state == DroneFlipState.FLIP_TURNED_45 and self.roll_accum > 315.0:
+            #     self.flip_state = DroneFlipState.FLIP_TURNED_315
+            #     self.flip_pitch_f = False
 
-            # 3) Если первый флип завершён, начинаем второй флип (повторяем состояния)
-            elif self.flip_state == DroneFlipState.FLIP_TURNED_315 and self.roll_accum > 360.0:
-                # Второй флип — сбросим состояние и начнём снова отслеживать углы
-                self.flip_count += 1  # Увеличиваем счетчик флипов
-                if self.flip_count < 2:  # Проверяем, если это первый флип, то повторяем
-                    self.flip_state = DroneFlipState.FLIP_INIT  # Сброс состояния для второго флипа
-                    self.roll_accum = 0.0  # Сброс накопленного угла для второго флипа
-                else:  # После второго флипа — выход в landing
-                    self.flip_state = DroneFlipState.LANDING
-                    self.main_state = DroneState.LANDING  # Переход в состояние посадки
+            # # 3) Если первый флип завершён, начинаем второй флип (повторяем состояния)
+            # elif self.flip_state == DroneFlipState.FLIP_TURNED_315 and self.roll_accum > 360.0:
+            #     # Второй флип — сбросим состояние и начнём снова отслеживать углы
+            #     self.flip_count += 1  # Увеличиваем счетчик флипов
+            #     if self.flip_count < 2:  # Проверяем, если это первый флип, то повторяем
+            #         self.flip_state = DroneFlipState.FLIP_INIT  # Сброс состояния для второго флипа
+            #         self.roll_accum = 0.0  # Сброс накопленного угла для второго флипа
+            #     else:  # После второго флипа — выход в landing
+            #         self.flip_state = DroneFlipState.LANDING
+            #         self.main_state = DroneState.LANDING  # Переход в состояние посадки
 
-            # 4) Восстановление после флипа
-            elif self.flip_state == DroneFlipState.FLIP_TURNED_315:
-                if self.alt < 5.0:
-                    self.flip_thrust_recovery_f = True
-                else:
-                    self.flip_thrust_recovery_f = False
-                    self.main_state = DroneState.LANDING
-                    self.flip_count = 0
+            # # 4) Восстановление после флипа
+            # elif self.flip_state == DroneFlipState.FLIP_TURNED_315:
+            #     if self.alt < 5.0:
+            #         self.flip_thrust_recovery_f = True
+            #     else:
+            #         self.flip_thrust_recovery_f = False
+            #         self.main_state = DroneState.LANDING
+            #         self.flip_count = 0
             
                 
         elif self.main_state == DroneState.LANDING:
