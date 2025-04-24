@@ -11,7 +11,8 @@ from scipy.spatial.transform import Rotation as R
  
 from rclpy.time import Time
 
-from dataclasses import dataclass, field
+
+from nav_msgs.msg import Odometry
 
 # ===== MATRIX OPERTIONS =====
 # ===== QUATERNION UTILS (SCIPY-based) =====
@@ -38,7 +39,6 @@ def quat_to_matrix(q):
     return R.from_quat(q).as_matrix()
 
 # ==========
-
 class DynamicModelNode(Node):
     def __init__(self):
         super().__init__('dynamic_model_node')
@@ -54,7 +54,7 @@ class DynamicModelNode(Node):
         # ======= PUBLISHERS =======
         self.pose_pub = self.create_publisher(PoseStamped, '/quad/pose_pred', qos_profile)
         self.motor_pub = self.create_publisher(Float32MultiArray, '/fmu/motor_inputs', qos_profile)
-        self.imu_position_pub = self.create_publisher(PoseStamped, '/drone/imu_position', qos_profile)
+        self.position_pub = self.create_publisher(PoseStamped, '/drone/imu_position', qos_profile)
         self.imu_pos_err_pub = self.create_publisher(Vector3, '/drone/imu_pos_err', qos_profile)
 
         # ======= SUBSCRIBERS =======
@@ -67,8 +67,12 @@ class DynamicModelNode(Node):
         self.create_subscription(ActuatorOutputs, '/fmu/out/actuator_outputs', self.actuator_outputs_callback, qos_profile)
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         # FOR EKF
-        self.create_subscription(SensorBaro, '/fmu/out/sensor_baro', self.sensor_baro_callback, self.qos_profile)
-        self.create_subscription(VehicleMagnetometer, '/fmu/out/vehicle_magnetometer', self.vehicle_magnetometer_callback, self.qos_profile)
+        self.create_subscription(SensorBaro, '/fmu/out/sensor_baro', self.sensor_baro_callback, qos_profile)
+        self.create_subscription(VehicleMagnetometer, '/fmu/out/vehicle_magnetometer', self.vehicle_magnetometer_callback, qos_profile)
+
+
+        # Подписываемся на топик с результатами фильтрации
+        self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, 10)
 
         # ======= DRONE CONSTRUCT PARAMETERS =======
         self.mass = 0.82
@@ -81,17 +85,13 @@ class DynamicModelNode(Node):
         self.drag = 0.1
         self.max_rate = 25.0  # рад/с, ограничение на угловую скорость (roll/pitch)
 
-        # ======= PREDICT PARAMETERS ======= 
-        self.state = np.zeros(12, dtype=float)  # [x, y, z, vx, vy, vz, roll, pitch, yaw, wx, wy, wz]
 
-        self.offset = np.zeros(3, dtype=np.float32)
-        
         # ======= DRONE LINEAR PARAMETERS ======= 
         # :[TOPIC NAME]_[PARAM NAME] OR [TOPIC NAME] IF PARAM = TOPIC NAME
         self.vehicleImu_velocity = np.zeros(3, dtype=np.float32) # Текущая линейная скорость (в мировых координатах)
         self.vehicleImu_linear_acceleration = np.zeros(3, dtype=np.float32)
         self.sensorCombined_linear_acceleration = np.zeros(3, dtype=np.float32)
-        self.imu_position = [0.0, 0.0, 0.0] # drone position estimates with IMU localization
+        self.position = [0.0, 0.0, 0.0] # drone position estimates with IMU localization
         self.motor_inputs = np.zeros(4)  # нормализованные входы [0..1] или RPM
 
         self.vehicleLocalPosition_position = np.zeros(3, dtype=np.float32) # actual position from 
@@ -99,8 +99,8 @@ class DynamicModelNode(Node):
         # ======= DRONE ANGULAR PARAMETERS =======  
         # :[TOPIC NAME]_[PARAM NAME] OR [TOPIC NAME] IF PARAM = TOPIC NAME
         # QUATERNIONS
-        self.sensorCombined_q = [0.0, 0.0, 0.0, 1.0] #  float32 
-        self.vehicleAttitude_q = [0.0, 0.0, 0.0, 1.0]
+        self.sensorCombined_q = [0.0, 0.0, 0.0, 1.0] #  float32  custom calculation
+        self.vehicleAttitude_q = [0.0, 0.0, 0.0, 1.0] # momental quaternion from topic
         self.q = [0.0, 0.0, 0.0, 1.0] # actual orientation
 
         # DELTA ANGLE
@@ -121,9 +121,8 @@ class DynamicModelNode(Node):
         # Инициализация состояния EKF (9 элементов: [x, y, z, vx, vy, vz, roll, pitch, yaw])
         # Инициализация фильтра Калмана для позиции и ориентации
         self.kalman_state = np.zeros(12)  # Состояние Калмана: [x, y, z, vx, vy, vz, qx, qy, qz, qw, wx, wy, wz]
+        
         self.P = np.eye(12)  # Ковариационная матрица
-        self.Q = np.eye(12) * 0.1  # Шум процесса (настраиваемый)
-        self.R = np.eye(6) * 0.1  # Шум измерений (позиция и ориентация)
         self.H = np.zeros((6, 12))  # Матрица измерений
         self.H[:3, :3] = np.eye(3)  # Измерения позиции
         self.H[3:7, 6:10] = np.eye(4)  # Измерения ориентации
@@ -134,14 +133,25 @@ class DynamicModelNode(Node):
 
         # ======= TIMERS =======
         self.timer = self.create_timer(0.01, self.step_dynamics)
-
         self.last_time = Time.time()
-        
+
+
+    def odom_callback(self, msg: Odometry):
+        # Обработка данных, например, извлечение позиции
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        self.get_logger().info(f'Position: x={position.x}, y={position.y}, z={position.z}')
+        self.get_logger().info(f'Orientation: x={orientation.x}, y={orientation.y}, z={orientation.z}, w={orientation.w}')
+
+    def sensor_baro_callback(self, msg):
+        self.baro_pressure = msg.baro_pressure
+        self.baro_temperature = msg.baro_temperature
 
     def vehicle_magnetometer_callback(self, msg: VehicleMagnetometer):
         # Измерения магнитометра
         self.magnetometer_data = np.array([msg.x, msg.y, msg.z], dtype=np.float32)
 
+    # ПОЗИЦИЯ ДЛЯ ОЦЕНКИ ИНЕРЦИАЛНОЙ ЛОКАЛИЗАЦИИ
     def vehicle_local_position_callback(self, msg: VehicleLocalPosition):
         #self.get_logger().info(f"vehicle_local_position_callback {msg.x} {msg.y} {msg.z}")
         self.vehicleLocalPosition_position[0] = msg.x
@@ -153,6 +163,7 @@ class DynamicModelNode(Node):
         # Преобразование PWM в радианы в секунду (линейное приближение)
         self.motor_inputs = np.clip((np.array(pwm_outputs) - 1000.0) / 1000.0 * self.max_speed, 0.0, self.max_speed)
 
+    # ЛИНЕЙНОЕ УСКОРЕНИЕ, УГЛОВОЕ УСКОРЕНИЕ, КВАТЕРНИОН
     def sensor_combined_callback(self, msg: SensorCombined):
         # === ГИРОСКОП ===
         dt_gyro = msg.gyro_integral_dt * 1e-6  # микросекунды -> секунды
@@ -163,13 +174,14 @@ class DynamicModelNode(Node):
         self.sensorCombined_delta_angle = delta_angle
 
         # Обновляем ориентацию на основе приращения
-        self.q = quat_multiply(self.q, R.from_rotvec(delta_angle).as_quat())
+        #self.q = quat_multiply(self.q, R.from_rotvec(delta_angle).as_quat())
         # OR self.q = normalize_quat(quat_multiply(self.q, R.from_rotvec(delta_angle).as_quat()))
 
         # === АКСЕЛЕРОМЕТР ===
         # average value acceleration in m/s^2 over the last accelerometer sampling period
         self.sensorCombined_linear_acceleration = np.array(msg.accelerometer_m_s2, dtype=np.float32)
          
+    # УГЛОВАЯ СКОРОСТЬ И УСКОРЕНИЕ
     def angular_velocity_callback(self, msg: VehicleAngularVelocity):
         self.angularVelocity = np.array(msg.xyz, dtype=np.float32)
         self.angularVelocity_angular_acceleration = np.array(msg.xyz_derivative, dtype=np.float32)
@@ -179,21 +191,29 @@ class DynamicModelNode(Node):
         # PX4 topic uses the Hamilton convention, and the order is q(w, x, y, z). So we reorder it
         self.vehicleAttitude_q = np.array([msg.q[1], msg.q[2], msg.q[3], msg.q[0]], dtype=np.float32)
         
+    # УГЛОВОЕ УСКОРЕНИЕ
     def vehicle_angular_acceleration_setpoint_callback(self, msg: VehicleAngularAccelerationSetpoint):
         self.vehiclAngularAcceleration_angular_acceleration = msg.xyz
 
+    # ЛИНЕЙНАЯ СКОРОСТЬ И УСКОРЕНИЕ  угловая скорость и ускорение
     def vehicle_imu_callback(self, msg: VehicleImu):
         # Сохраняем приращения
-        self.vehicleImu_delta_angle = np.array(msg.delta_angle, dtype=np.float32)         # рад
-        self.vehicleImu_delta_velocity = np.array(msg.delta_velocity, dtype=np.float32)   # м/с
+        delta_angle = np.array(msg.delta_angle, dtype=np.float32)         # рад
+        delta_velocity = np.array(msg.delta_velocity, dtype=np.float32)   # м/с
+
+        self.vehicleImu_delta_angle = delta_angle       # рад
+        self.vehicleImu_delta_velocity = delta_velocity  # м/с
+
         delta_angle_dt = msg.delta_angle_dt * 1e-6     # с
         delta_velocity_dt = msg.delta_velocity_dt * 1e-6  # с
 
-        # Вычисляем угловую скорость и ускорение
+        # УГЛОВАЯ СКОРОСТЬ
         if delta_angle_dt > 0:
-            self.vehicleImu_angular_velocity = self.vehicleImu_delta_angle / delta_angle_dt
+            self.vehicleImu_angular_velocity = delta_angle / delta_angle_dt
+        
+        # УСКОРЕНИЕ
         if delta_velocity_dt > 0:
-            accel_body = self.vehicleImu_delta_velocity / delta_velocity_dt
+            accel_body = delta_velocity / delta_velocity_dt
             self.vehicleImu_linear_acceleration = accel_body
 
         # Переводим ускорение в мировую систему координат (через кватернион self.q)
@@ -204,63 +224,17 @@ class DynamicModelNode(Node):
         gravity = np.array([0, 0, 9.81])
         accel_corrected = accel_world - gravity
 
-        # Интегрируем ускорение, чтобы получить скорость
+        # Интеграция линейного ускорения для получения скорости
         self.vehicleImu_velocity += accel_corrected * delta_velocity_dt
-
-    def publish_pose(self):
-        msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world'
-        msg.pose.position.x = self.state[0]
-        msg.pose.position.y = self.state[1]
-        msg.pose.position.z = self.state[2]
-        msg.pose.orientation.x = self.q[0]
-        msg.pose.orientation.y = self.q[1]
-        msg.pose.orientation.z = self.q[2]
-        msg.pose.orientation.w = self.q[3]
-        self.pose_pub.publish(msg)
 
     def publish_motor_inputs(self):
         msg = Float32MultiArray()
         msg.data = self.motor_inputs.tolist()
         self.motor_pub.publish(msg)
 
-    def imu_update(self):
-        dt = 0.01  # фиксированный шаг времени
-
-        # Сначала выполняем предсказание с использованием текущего состояния и переходной матрицы F
-        self.x[:6] = self.x[:6] + self.x[3:6] * dt  # Обновляем позицию и скорость
-
-        # Обновление матрицы перехода состояния F
-        self.F[:3, 3:6] = np.eye(3) * dt  # Дельта-позиция зависит от скорости
-
-        # Обновляем ковариационную матрицу
-        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
-
-        # Формируем измерения для обновления EKF (акселерометр, гироскоп, магнитометр)
-        z = np.concatenate([self.sensorCombined_linear_acceleration, self.sensorCombined_angular_velocity, self.magnetometer_data])
-
-        # Обновляем матрицу измерений H (связь между состоянием и измерениями)
-        self.H[:3, 3:6] = np.eye(3)  # Акселерометр, связанный с ускорением
-        self.H[3:6, 6:9] = np.eye(3)  # Гироскоп, связанный с угловыми скоростями
-        self.H[6:9, 0:3] = np.eye(3)  # Магнитометр, связанный с позицией
-
-        # Калькуляция остатка между измерением и предсказанным состоянием
-        y = z - np.dot(self.H, self.x)
-
-        # Обновление ковариационной матрицы
-        S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
-        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))  # Калмановский коэффициент
-
-        # Обновление состояния
-        self.x = self.x + np.dot(K, y)
-
-        # Обновление ковариационной матрицы
-        self.P = self.P - np.dot(np.dot(K, self.H), self.P)
-    
     def publish_imu_localization_err(self):
         # Count error
-        imu_pos = np.array(self.imu_position)
+        imu_pos = np.array(self.position)
         px4_pos = np.array(self.vehicleLocalPosition_position)
 
         pos_err = imu_pos - px4_pos
@@ -279,245 +253,134 @@ class DynamicModelNode(Node):
 
         self.imu_pos_err_pub.publish(err_msg)
 
-    # def publish_imu_localization(self):
-    #     current_time = Time.time()
 
-    #     dt = current_time - self.last_time
-    #     self.last_time = current_time
+    def imu_navigation(self):
+        print()
 
-    #     # === ОБНОВЛЕНИЕ ОРИЕНТАЦИИ ПО УГЛОВОЙ СКОРОСТИ ===
-    #     omega = self.vehicleImu_angular_velocity  # [rad/s]
-    #     q = np.array(self.q)                      # [x, y, z, w]
-    #     q = np.roll(q, 1)                         # → [w, x, y, z]
+    def complementary_filter(self):
+        """
+        Фильтр комплементарности для вычисления ориентации (pitch, roll, yaw)
+        
+        :param accel_data: Данные акселерометра (accel_x, accel_y, accel_z)
+        :param gyro_data: Данные гироскопа (gyro_x, gyro_y, gyro_z)
+        :param mag_data: Данные магнитометра (mag_x, mag_y, mag_z)
+        :param dt: Время между двумя измерениями (в секундах)
+        """
 
-    #     omega_quat = np.array([0.0, *omega])
-    #     q_dot = 0.5 * quat_multiply(q, omega_quat)
-    #     q_new = q + q_dot * dt
-    #     q_new = q_new / np.linalg.norm(q_new)
-    #     q_new = np.roll(q_new, -1)               # → [x, y, z, w]
+        accel_data=self.vehicleImu_linear_acceleration
+        gyro_data=self.vehicleImu_angular_velocity
+        mag_data=self.magnetometer_data
+        dt=
+        # Акселерометрические углы (pitch, roll) вычисляются на основе ускорения
+        accel_pitch = math.atan2(accel_data[1], accel_data[2])
+        accel_roll = math.atan2(-accel_data[0], math.sqrt(accel_data[1]**2 + accel_data[2]**2))
+        
+        # Интегрирование угловой скорости гироскопа для получения углов
+        gyro_pitch = self.pitch + gyro_data[0] * dt
+        gyro_roll = self.roll + gyro_data[1] * dt
+        gyro_yaw = self.yaw + gyro_data[2] * dt
+        
+        # Использование фильтра комплементарности для комбинирования данных акселерометра и гироскопа
+        alpha = 0.98  # Коэффициент фильтра (можно настраивать)
+        
+        self.pitch = alpha * gyro_pitch + (1 - alpha) * accel_pitch
+        self.roll = alpha * gyro_roll + (1 - alpha) * accel_roll
 
-    #     self.q = q_new.tolist()
+        # Магнитометр для корректировки yaw
+        mag_yaw = math.atan2(mag_data[1], mag_data[0])  # yaw из магнитометра
+        
+        # Коррекция yaw с использованием магнитометра
+        self.yaw = gyro_yaw + (mag_yaw - gyro_yaw) * (1 - alpha)
 
-    #     # === ПЕРЕВОД УСКОРЕНИЯ В МИРОВУЮ СК ===
-    #     a_body = self.sensorCombined_linear_acceleration  # [m/s^2]
-    #     R = quat_to_matrix(np.roll(q_new, 1))  # [w, x, y, z]
-    #     a_world = R @ a_body
+        return self.pitch, self.roll, self.yaw
 
-    #     # === КОМПЕНСАЦИЯ ГРАВИТАЦИИ ===
-    #     g = np.array([0.0, 0.0, -9.81])
-    #     a_world += g
+    
+    # MY  EKF
+    def update(self, z, H, R, h_func):
+        z_pred = h_func(self.x)             # Предсказание измерения
+        y = z - z_pred                      # Ошибка измерения
+        S = H @ self.P @ H.T + R            # Инновационная ковариация
+        K = self.P @ H.T @ np.linalg.inv(S) # Калмановское усиление
+        self.x = self.x + K @ y
+        self.P = (np.eye(len(self.x)) - K @ H) @ self.P
 
-    #     # === ИНТЕГРАЦИЯ СКОРОСТИ И ПОЛОЖЕНИЯ ===
-    #     self.vehicleImu_velocity += a_world * dt
-    #     self.imu_position += self.vehicleImu_velocity * dt
+    def predict(self, x, u):
+        x_pred = self.f(x, u)         # Используется твоя модель f(x, u)
+        F = self.compute_F(x, u)      # Якобиан f по x (13x13)
+        self.P = F @ self.P @ F.T + self.Q
+        self.x = x_pred
 
-    #     # === ПУБЛИКАЦИЯ В ЛОГ ===
-    #     self.get_logger().info(
-    #         f"publish_imu_localization pose: {self.imu_position[0]:.3f} {self.imu_position[1]:.3f} {self.imu_position[2]:.3f}  "
-    #         f"quaternion: {self.q[0]:.3f} {self.q[1]:.3f} {self.q[2]:.3f} {self.q[3]:.3f}"
-    #     )
-
-    #     # === ПУБЛИКАЦИЯ ROS-СООБЩЕНИЯ ===
-    #     pose_msg = PoseStamped()
-    #     pose_msg.header.stamp = self.get_clock().now().to_msg()
-    #     pose_msg.header.frame_id = 'map'
-
-    #     pose_msg.pose.position.x = float(self.imu_position[0])
-    #     pose_msg.pose.position.y = float(self.imu_position[1])
-    #     pose_msg.pose.position.z = float(self.imu_position[2])
-
-    #     pose_msg.pose.orientation.x = float(self.q[0])
-    #     pose_msg.pose.orientation.y = float(self.q[1])
-    #     pose_msg.pose.orientation.z = float(self.q[2])
-    #     pose_msg.pose.orientation.w = float(self.q[3])
-
-    #     self.imu_position_pub.publish(pose_msg)
-
-
-    def predict_state(self, dt):
-        # === Извлечение состояния ===
-        pos = self.state[0:3]          # [x, y, z]
-        vel = self.state[3:6]          # [vx, vy, vz]
-        q   = np.array(self.q)         # [x, y, z, w] кватернион
-        omega = self.state[9:12]       # [wx, wy, wz] угловые скорости
+    def f(self, x, u, dt):
+        """
+        Нелинейная динамическая модель квадрокоптера.
+   
+        """
+        # параметры
         m = self.mass
-        J = self.inertia
-        g = np.array([0, 0, -9.81])
+        I = self.inertia
+        arm = self.arm_length
+        kf = self.k_thrust
+        km = self.k_torque
+        drag = self.drag
+        g = np.array([0, 0, 9.81])
+        max_rate = self.max_rate
+        max_speed = self.max_speed
 
-        # === Динамика моторов ===
-        omega_cmd = self.motor_inputs * self.max_speed
-        self.motor_speeds += (omega_cmd - self.motor_speeds) * (dt / self.motor_tau)
-        omega_squared = np.clip(self.motor_speeds, 0, self.max_speed)**2
-        thrusts = self.k_thrust * omega_squared
+        # вектор состояния [позиция, скорость, кватернион, угловая скорость]
+        pos = x[0:3]
+        vel = x[3:6]
+        quat = x[6:10]
+        omega = x[10:13]
 
-        # === Общая сила и момент в теле ===
-        total_thrust_body = np.array([0.0, 0.0, np.sum(thrusts)])
-        tau = np.zeros(3)
-        tau[0] = self.arm_length * (thrusts[1] - thrusts[3])  # roll
-        tau[1] = self.arm_length * (thrusts[2] - thrusts[0])  # pitch
-        tau[2] = self.k_torque * (thrusts[0] - thrusts[1] + thrusts[2] - thrusts[3])  # yaw
+        #u = self.motor_inputs # u - управление (обороты моторов) [w1, w2, w3, w4] 
+        #dt = 0.01 # dt - шаг времени
+        quat /= np.linalg.norm(quat) # нужно ли нормализовывать кватернион из PX4 топика
 
-        # === Преобразование силы в мировую систему координат ===
-        R_world_from_body = quat_to_matrix(q)
-        total_thrust_world = R_world_from_body @ total_thrust_body
+        R_bw = R.from_quat(quat).as_matrix()  # Перевод ориентации в матрицу
 
-        # === Линейное ускорение в мировой системе ===
-        acc = g + (1.0 / m) * total_thrust_world - self.drag * vel
+        rpm = np.clip(u, 0, max_speed) # Вычисляем тягу каждого мотора
+        w_squared = rpm**2
+        thrusts = kf * w_squared
 
-        # === Угловое ускорение в теле ===
-        omega_dot = np.linalg.inv(J) @ (tau - np.cross(omega, J @ omega))
+        Fz = np.array([0, 0, np.sum(thrusts)]) # Общая тяга в теле
 
-        # === Интеграция кватерниона ===
-        q_dot = self.angular_velocity_to_quat_derivative(q, omega)
-        q_new = self.normalize_quat(q + q_dot * dt)
+        F_world = R_bw @ Fz - m * g - drag * vel # Сила в мировой системе с компенсацией гравитации и сопротивления
 
-        # === Обновление состояния ===
-        pos_new = pos + vel * dt
-        vel_new = vel + acc * dt
-        omega_new = omega + omega_dot * dt
+        # Обновление линейной скорости и позиции
+        acc = F_world / m # ускорение в мировой ск, второй закон ньютона
+        new_vel = vel + acc * dt
+        new_pos = pos + vel * dt + 0.5 * acc * dt**2
 
-        self.state[0:3] = pos_new
-        self.state[3:6] = vel_new
-        self.q = q_new
-        self.state[9:12] = omega_new
+        # Моменты (упрощённо: крестовина)
+        L = arm
+        tau = np.array([
+            L * (thrusts[1] - thrusts[3]),
+            L * (thrusts[2] - thrusts[0]),
+            km * (w_squared[0] - w_squared[1] + w_squared[2] - w_squared[3])
+        ])
 
-        # === Подготовка для фильтра Калмана ===
-        # Прогнозируемое состояние (предсказание)
-        predicted_state = np.concatenate([pos_new, vel_new, q_new, omega_new])
+        # Обновление угловой скорости (Жуковский)
+        omega_dot = np.linalg.inv(I) @ (tau - np.cross(omega, I @ omega))
+        new_omega = omega + omega_dot * dt
 
-        # === Матрицы Калмана ===
-        F = np.eye(12)  # Матрица перехода состояния (12x12)
-        F[0:3, 3:6] = np.eye(3) * dt  # Переход от позиции к скорости
-        F[6:9, 9:12] = np.eye(3) * dt  # Переход от угловой скорости к угловым ускорениям
+        # Обновление ориентации через кватернион
+        omega_quat = np.concatenate(([0.0], omega))
+        dq = 0.5 * quat_multiply(quat, omega_quat)
+        new_quat = quat + dq * dt
+        new_quat /= np.linalg.norm(new_quat)
 
-        # Ковариация шума процесса (можно подстроить под ситуацию)
-        Q = np.eye(12) * 0.001  # Шум процесса (регулируется)
+        # Собираем новое состояние
+        x_next = np.zeros(13)
+        x_next[0:3] = new_pos
+        x_next[3:6] = new_vel
+        x_next[6:10] = new_quat
+        x_next[10:13] = new_omega
 
-        # Ковариационная матрица для предсказания состояния
-        P_predicted = F @ self.P @ F.T + Q
-
-        # === Обновление состояния с использованием наблюдений (например, IMU или GPS) ===
-        # Мы будем обновлять состояние на основе полученных наблюдений (например, из IMU, GPS или других сенсоров).
-        # Зависит от того, какие именно данные у тебя есть.
-
-        # Пример обновления для позиции и ориентации:
-        z_pos = self.vehicleLocalPosition_position  # Пример измерения позиции
-        z_q = self.vehicleAttitude_q  # Пример измерения ориентации
-
-        # Матрица наблюдений для позиции (позиция — это 3 значения: x, y, z)
-        H_pos = np.zeros((3, 12))
-        H_pos[0:3, 0:3] = np.eye(3)
-
-        # Матрица наблюдений для ориентации (кватернионы — это 4 значения)
-        H_q = np.zeros((4, 12))
-        H_q[0:3, 6:9] = np.eye(3)
-
-        # Ковариации наблюдений (позиции и ориентации)
-        R_pos = np.eye(3) * 0.05  # Коэффициент ковариации для позиции
-        R_q = np.eye(4) * 0.01  # Коэффициент ковариации для ориентации
-
-        # Разница между измерениями и предсказанием (ошибки)
-        y_pos = z_pos - pos_new
-        y_q = quat_diff(q_new, z_q)
-
-        # Калмановский коэффициент для позиции
-        S_pos = H_pos @ P_predicted @ H_pos.T + R_pos
-        K_pos = P_predicted @ H_pos.T @ np.linalg.inv(S_pos)
-        self.state += K_pos @ y_pos
-        self.P = (np.eye(12) - K_pos @ H_pos) @ P_predicted
-
-        # Калмановский коэффициент для ориентации
-        S_q = H_q @ P_predicted @ H_q.T + R_q
-        K_q = P_predicted @ H_q.T @ np.linalg.inv(S_q)
-        self.state += K_q @ y_q
-        self.P = (np.eye(12) - K_q @ H_q) @ P_predicted
-
-        # Публикация обновленного состояния
-        self.publish_ekf_pose()
+        return x_next
 
 
 
-    def kalman_filter_update(self, pos_new, vel_new, q_new, omega_new):
-        # Применение фильтра Калмана для позиции и ориентации
-        # Измерения: позиция и ориентация
-        z = np.concatenate([pos_new, q_new])
-
-        # Прогнозируемое состояние
-        x_pred = self.kalman_state  # Прогнозируемое состояние
-        P_pred = self.P + self.Q  # Прогнозируемая ковариация
-
-        # Измерения (позиция и ориентация)
-        y = z - self.H @ x_pred  # Отклонение от измерений
-
-        # Ковариация измерений
-        S = self.H @ P_pred @ self.H.T + self.R
-
-        # Калмановский коэффициент
-        K = P_pred @ self.H.T @ np.linalg.inv(S)
-
-        # Обновление состояния и ковариации
-        self.kalman_state = x_pred + K @ y
-        self.P = P_pred - K @ self.H @ P_pred
-
-    # def simulate_trajectory(self, current_state, q, motor_inputs_seq, dt, horizon):
-    #     trajectory = []
-    #     state = np.copy(current_state)
-    #     orientation_q = np.copy(q)
-
-    #     for i in range(horizon):
-    #         self.state = state
-    #         self.q = orientation_q
-    #         self.motor_inputs = motor_inputs_seq[i]  # последовательность управляющих воздействий
-    #         self.predict_state(dt)
-    #         trajectory.append((self.state.copy(), self.q.copy()))
-    #         state = self.state.copy()
-    #         orientation_q = self.q.copy()
-    #     return trajectory
-
-    # def run_mpc_controller(self, target_pos, target_q, horizon=20, dt=0.05):
-    #     def cost(u_flat):
-    #         u = u_flat.reshape((horizon, 4))  # управление на горизонте: (N, 4 мотора)
-    #         total_cost = 0.0
-
-    #         # Сохраним начальное состояние
-    #         original_state = self.state.copy()
-    #         original_q = self.q.copy()
-
-    #         for t in range(horizon):
-    #             self.motor_inputs = np.clip(u[t], 0.0, 1.0)
-    #             self.predict_state(dt)
-
-    #             pos = self.state[0:3]
-    #             q = self.q
-
-    #             # Ошибка позиции
-    #             pos_err = np.linalg.norm(pos - target_pos)
-
-    #             # Ошибка ориентации (угол между кватернионами)
-    #             dot_product = np.dot(q, target_q)
-    #             dot_product = np.clip(dot_product, -1.0, 1.0)
-    #             angle_err = 2 * np.arccos(np.abs(dot_product))
-
-    #             total_cost += pos_err**2 + angle_err**2
-
-    #         # Восстанавливаем состояние
-    #         self.state = original_state
-    #         self.q = original_q
-
-    #         return total_cost
-
-    #     # Начальное приближение: hover inputs
-    #     u0 = np.ones((horizon, 4)) * 0.5
-    #     bounds = [(0.0, 1.0)] * (horizon * 4)
-
-    #     res = minimize(cost, u0.flatten(), bounds=bounds, method='L-BFGS-B')
-
-    #     if res.success:
-    #         u_opt = res.x.reshape((horizon, 4))
-    #         self.motor_inputs = u_opt[0]  # применяем только первое управляющее воздействие
-    #     else:
-    #         print("MPC optimization failed:", res.message)
-
+ 
 
 def main(args=None):
     rclpy.init(args=args)
