@@ -12,10 +12,16 @@ from scipy.spatial.transform import Rotation as R
 from rclpy.time import Time
 
 
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry  # inner ROS2 SEKF
+from filterpy.kalman import ExtendedKalmanFilter
+
+ 
 
 # ===== MATRIX OPERTIONS =====
 # ===== QUATERNION UTILS (SCIPY-based) =====
+
+
+SEA_LEVEL_PRESSURE = 101325.0
 
 def quat_multiply(q1, q2):
     """Multiply two quaternions [x, y, z, w] using scipy."""
@@ -85,54 +91,46 @@ class DynamicModelNode(Node):
         self.drag = 0.1
         self.max_rate = 25.0  # рад/с, ограничение на угловую скорость (roll/pitch)
 
-
-        # ======= DRONE LINEAR PARAMETERS ======= 
-        # :[TOPIC NAME]_[PARAM NAME] OR [TOPIC NAME] IF PARAM = TOPIC NAME
-        self.vehicleImu_velocity = np.zeros(3, dtype=np.float32) # Текущая линейная скорость (в мировых координатах)
+        self.angularVelocity = np.zeros(3, dtype=np.float32)
+        self.vehicleImu_velocity = np.zeros(3, dtype=np.float32) # в мировых координатах
         self.vehicleImu_linear_acceleration = np.zeros(3, dtype=np.float32)
-        self.sensorCombined_linear_acceleration = np.zeros(3, dtype=np.float32)
         self.position = [0.0, 0.0, 0.0] # drone position estimates with IMU localization
         self.motor_inputs = np.zeros(4)  # нормализованные входы [0..1] или RPM
-
-        self.vehicleLocalPosition_position = np.zeros(3, dtype=np.float32) # actual position from 
-         
-        # ======= DRONE ANGULAR PARAMETERS =======  
-        # :[TOPIC NAME]_[PARAM NAME] OR [TOPIC NAME] IF PARAM = TOPIC NAME
-        # QUATERNIONS
-        self.sensorCombined_q = [0.0, 0.0, 0.0, 1.0] #  float32  custom calculation
         self.vehicleAttitude_q = [0.0, 0.0, 0.0, 1.0] # momental quaternion from topic
-        self.q = [0.0, 0.0, 0.0, 1.0] # actual orientation
+        self.magnetometer_data = np.zeros(3, dtype=np.float32)
+        self.baro_attitude = 0.0
+        # FOR TESTING IN SITL
+        self.vehicleLocalPosition_position = np.zeros(3, dtype=np.float32)  
 
-        # DELTA ANGLE
-        self.sensorCombined_delta_angle = np.zeros(3, dtype=np.float32)
-        self.vehicleImu_delta_angle = np.zeros(3, dtype=np.float32)
-        self.vehicleImu_delta_velocity = np.zeros(3, dtype=np.float32)
-
-        # ANGULAR VELOCITY
+        # ======= TOPIC DATA ======= 
+        # :[TOPIC NAME]_[PARAM NAME] OR [TOPIC NAME] IF PARAM = TOPIC NAME
+        self.vehicleImu_velocity = np.zeros(3, dtype=np.float32) # Текущая линейная скорость (в мировых координатах)
+        self.sensorCombined_linear_acceleration = np.zeros(3, dtype=np.float32)
+        self.sensorCombined_q = [0.0, 0.0, 0.0, 1.0] #  float32  custom calculation
         self.sensorCombined_angular_velocity = np.zeros(3, dtype=np.float32)
-        self.angularVelocity = np.zeros(3, dtype=np.float32)
         self.vehicleImu_angular_velocity = np.zeros(3, dtype=np.float32)
-
-        # ANGULAR ACCELERATION
         self.angularVelocity_angular_acceleration = np.zeros(3, dtype=np.float32)
         self.vehiclAngularAcceleration_angular_acceleration = np.zeros(3, dtype=np.float32)
-
-        # ======= EKF =======
-        # Инициализация состояния EKF (9 элементов: [x, y, z, vx, vy, vz, roll, pitch, yaw])
-        # Инициализация фильтра Калмана для позиции и ориентации
-        self.kalman_state = np.zeros(12)  # Состояние Калмана: [x, y, z, vx, vy, vz, qx, qy, qz, qw, wx, wy, wz]
-        
-        self.P = np.eye(12)  # Ковариационная матрица
-        self.H = np.zeros((6, 12))  # Матрица измерений
-        self.H[:3, :3] = np.eye(3)  # Измерения позиции
-        self.H[3:7, 6:10] = np.eye(4)  # Измерения ориентации
-
-        self.magnetometer_data = np.zeros(3, dtype=np.float32)
-        self.baro_pressure = 0.0 # static pressure measurement in Pascals
         self.baro_temperature = 0.0 # temperature in degrees Celsius
 
+        # ======= EKF =======
+        self.ekf = ExtendedKalmanFilter(dim_x=13, dim_z=4)  # z: baro (1) + magnetometer (3)
+        # Подключаем функцию перехода состояния
+        self.ekf.fx = self.fx
+        # Подключаем функцию измерения
+        self.ekf.hx = self.hx
+        # Состояние: позиция, скорость, кватернион
+        self.ekf.x = np.zeros(13)
+        self.ekf.x[6] = 1.0  # qw = 1 (единичный кватернион)
+
+        # Начальные ковариации
+        self.ekf.P *= 0.1
+        self.ekf.Q *= 0.01
+        self.ekf.R = np.diag([0.5, 0.05, 0.05, 0.05])  # baro + mag
+        
         # ======= TIMERS =======
         self.timer = self.create_timer(0.01, self.step_dynamics)
+        self.position_IMU_timer = self.create_timer(0.01, self.position_IMU)
         self.last_time = Time.time()
 
 
@@ -144,8 +142,8 @@ class DynamicModelNode(Node):
         self.get_logger().info(f'Orientation: x={orientation.x}, y={orientation.y}, z={orientation.z}, w={orientation.w}')
 
     def sensor_baro_callback(self, msg):
-        self.baro_pressure = msg.baro_pressure
         self.baro_temperature = msg.baro_temperature
+        self.baro_attitude = 44330.0 * (1.0 - (msg.baro_pressure / SEA_LEVEL_PRESSURE) ** 0.1903)
 
     def vehicle_magnetometer_callback(self, msg: VehicleMagnetometer):
         # Измерения магнитометра
@@ -165,20 +163,13 @@ class DynamicModelNode(Node):
 
     # ЛИНЕЙНОЕ УСКОРЕНИЕ, УГЛОВОЕ УСКОРЕНИЕ, КВАТЕРНИОН
     def sensor_combined_callback(self, msg: SensorCombined):
-        # === ГИРОСКОП ===
         dt_gyro = msg.gyro_integral_dt * 1e-6  # микросекунды -> секунды
         gyro_rad = np.array(msg.gyro_rad, dtype=np.float32)  # угловая скорость (рад/с)
         self.sensorCombined_angular_velocity = gyro_rad
          
         delta_angle = gyro_rad * dt_gyro # Угловое приращение (рад)
         self.sensorCombined_delta_angle = delta_angle
-
-        # Обновляем ориентацию на основе приращения
-        #self.q = quat_multiply(self.q, R.from_rotvec(delta_angle).as_quat())
-        # OR self.q = normalize_quat(quat_multiply(self.q, R.from_rotvec(delta_angle).as_quat()))
-
-        # === АКСЕЛЕРОМЕТР ===
-        # average value acceleration in m/s^2 over the last accelerometer sampling period
+     
         self.sensorCombined_linear_acceleration = np.array(msg.accelerometer_m_s2, dtype=np.float32)
          
     # УГЛОВАЯ СКОРОСТЬ И УСКОРЕНИЕ
@@ -199,64 +190,34 @@ class DynamicModelNode(Node):
     def vehicle_imu_callback(self, msg: VehicleImu):
         # Сохраняем приращения
         delta_angle = np.array(msg.delta_angle, dtype=np.float32)         # рад
-        delta_velocity = np.array(msg.delta_velocity, dtype=np.float32)   # м/с
-
-        self.vehicleImu_delta_angle = delta_angle       # рад
-        self.vehicleImu_delta_velocity = delta_velocity  # м/с
-
         delta_angle_dt = msg.delta_angle_dt * 1e-6     # с
+
+        delta_velocity = np.array(msg.delta_velocity, dtype=np.float32)   # м/с
         delta_velocity_dt = msg.delta_velocity_dt * 1e-6  # с
 
         # УГЛОВАЯ СКОРОСТЬ
         if delta_angle_dt > 0:
             self.vehicleImu_angular_velocity = delta_angle / delta_angle_dt
         
-        # УСКОРЕНИЕ
+        self.vehicleImu_velocity += delta_velocity
         if delta_velocity_dt > 0:
-            accel_body = delta_velocity / delta_velocity_dt
-            self.vehicleImu_linear_acceleration = accel_body
+            # Преобразуем скорость из локальной системы в мировую
+            if self.vehicleAttitude_q is not None:
+                # Используем кватернион ориентации для преобразования
+                rotation = R.from_quat(self.vehicleAttitude_q)
+                # Преобразуем линейное ускорение в мировую систему координат
+                velocity_world = rotation.apply(self.vehicleImu_velocity)
+                
+                # Интегрируем скорость по времени для вычисления изменения позиции
+                self.position += velocity_world * delta_velocity_dt
 
-        # Переводим ускорение в мировую систему координат (через кватернион self.q)
-        rotation = R.from_quat(self.q)  # self.q = [x, y, z, w]
-        accel_world = rotation.apply(accel_body)
-
-        # Компенсируем гравитацию (предположим NED)
-        gravity = np.array([0, 0, 9.81])
-        accel_corrected = accel_world - gravity
-
-        # Интеграция линейного ускорения для получения скорости
-        self.vehicleImu_velocity += accel_corrected * delta_velocity_dt
 
     def publish_motor_inputs(self):
         msg = Float32MultiArray()
         msg.data = self.motor_inputs.tolist()
         self.motor_pub.publish(msg)
 
-    def publish_imu_localization_err(self):
-        # Count error
-        imu_pos = np.array(self.position)
-        px4_pos = np.array(self.vehicleLocalPosition_position)
-
-        pos_err = imu_pos - px4_pos
-        self.get_logger().info(f"imu pose err {pos_err[0]} {pos_err[1]} {pos_err[2]}")
-
-        imu_q = np.array(self.q)
-        px4_q = np.array(self.vehicleAttitude_q)
-        quat_diff = imu_q - px4_q
-        self.get_logger().info(f"imu quaternion err {quat_diff[0]:.3f} {quat_diff[1]:.3f} {quat_diff[2]:.3f} {quat_diff[3]:.3f}")
-
-        # Публикация ошибки
-        err_msg = Vector3()
-        err_msg.x = float(pos_err[0])
-        err_msg.y = float(pos_err[1])
-        err_msg.z = float(pos_err[2])
-
-        self.imu_pos_err_pub.publish(err_msg)
-
-
-    def imu_navigation(self):
-        print()
-
+  
     def complementary_filter(self):
         """
         Фильтр комплементарности для вычисления ориентации (pitch, roll, yaw)
@@ -270,7 +231,7 @@ class DynamicModelNode(Node):
         accel_data=self.vehicleImu_linear_acceleration
         gyro_data=self.vehicleImu_angular_velocity
         mag_data=self.magnetometer_data
-        dt=
+        dt=0.01
         # Акселерометрические углы (pitch, roll) вычисляются на основе ускорения
         accel_pitch = math.atan2(accel_data[1], accel_data[2])
         accel_roll = math.atan2(-accel_data[0], math.sqrt(accel_data[1]**2 + accel_data[2]**2))
@@ -293,27 +254,47 @@ class DynamicModelNode(Node):
         self.yaw = gyro_yaw + (mag_yaw - gyro_yaw) * (1 - alpha)
 
         return self.pitch, self.roll, self.yaw
-
+ 
+    def get_yaw_from_mag(self):
+        r = R.from_quat(self.vehicleAttitude_q)  # [x, y, z, w]
     
-    # MY  EKF
-    def update(self, z, H, R, h_func):
-        z_pred = h_func(self.x)             # Предсказание измерения
-        y = z - z_pred                      # Ошибка измерения
-        S = H @ self.P @ H.T + R            # Инновационная ковариация
-        K = self.P @ H.T @ np.linalg.inv(S) # Калмановское усиление
-        self.x = self.x + K @ y
-        self.P = (np.eye(len(self.x)) - K @ H) @ self.P
+        # Преобразуем магнитное поле в мировую систему координат
+        mag_world = r.apply(self.magnetometer_data)
 
-    def predict(self, x, u):
-        x_pred = self.f(x, u)         # Используется твоя модель f(x, u)
-        F = self.compute_F(x, u)      # Якобиан f по x (13x13)
-        self.P = F @ self.P @ F.T + self.Q
-        self.x = x_pred
+        # Проекция магнитного поля на горизонтальную плоскость (X, Y)
+        mag_x = mag_world[0]
+        mag_y = mag_world[1]
+        # Вычисляем yaw (в радианах)
+        yaw_from_magnetometer = np.arctan2(-mag_y, mag_x)
+        return yaw_from_magnetometer
+    
+    def EKF(self):
+         
+        z = [self.baro_attitude, self.get_yaw_from_mag]
 
-    def f(self, x, u, dt):
+        # Предсказание следующего состояния
+        self.ekf.predict(dt=0.01)
+
+        # Обновление состояния фильтра с использованием новых данных
+        self.ekf.update(z)
+
+
+    def hx(self, x):
+        """ модель измерений: измеряется  """
+
+        # baro
+
+        # mag
+        
+
+        return np.array([x[0]])  # Возвращаем только позицию из состояния
+
+    def fx(self, x, dt):
         """
-        Нелинейная динамическая модель квадрокоптера.
-   
+        Нелинейная динамическая модель квадрокоптера
+        dt - шаг времени
+        x - вектор состояния [позиция, скорость, кватернион, угловая скорость]
+        u - управление (обороты моторов) [w1, w2, w3, w4] 
         """
         # параметры
         m = self.mass
@@ -326,15 +307,15 @@ class DynamicModelNode(Node):
         max_rate = self.max_rate
         max_speed = self.max_speed
 
-        # вектор состояния [позиция, скорость, кватернион, угловая скорость]
         pos = x[0:3]
         vel = x[3:6]
         quat = x[6:10]
         omega = x[10:13]
 
-        #u = self.motor_inputs # u - управление (обороты моторов) [w1, w2, w3, w4] 
+        u = self.motor_inputs  
         #dt = 0.01 # dt - шаг времени
-        quat /= np.linalg.norm(quat) # нужно ли нормализовывать кватернион из PX4 топика
+
+        quat /= np.linalg.norm(quat)
 
         R_bw = R.from_quat(quat).as_matrix()  # Перевод ориентации в матрицу
 
@@ -377,6 +358,7 @@ class DynamicModelNode(Node):
         x_next[10:13] = new_omega
 
         return x_next
+        #return np.array([new_position, new_velocity])
 
 
 
