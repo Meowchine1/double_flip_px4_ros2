@@ -34,8 +34,8 @@ setup(
                 'visualizer = px4_offboard.visualizer:main',
                 'processes = px4_offboard.processes:main',
                 'flip = px4_offboard.flip:main',
-                'drone_dynamics = px4_offboard.drone_dynamics:main'
+                'dynamic_model_node = px4_offboard.dynamic_model_node:main'
                  
-        ],  #'double_flip = px4_offboard.double_flip:main'
+        ],
     },
 )

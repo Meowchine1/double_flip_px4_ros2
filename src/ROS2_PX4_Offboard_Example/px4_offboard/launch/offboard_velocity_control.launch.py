@@ -71,8 +71,8 @@ def generate_launch_description():
         Node(
             package='px4_offboard',
             namespace='px4_offboard',
-            executable='drone_dynamics',
-            name='drone_dynamics', 
+            executable='dynamic_model_node',
+            name='dynamic_model_node', 
         ),
         
         Node(
@@ -81,5 +81,12 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2',
             arguments=['-d', [os.path.join(package_dir, 'visualize.rviz')]]
+        ),
+        Node(
+            package='robot_localization',
+            executable='ekf_node',
+            name='ekf_filter_node',
+            output='screen',
+            parameters=['config/ekf.yaml']
         )
     ])

@@ -16,15 +16,17 @@ from px4_msgs.msg import (
 )
 import numpy as np
 from enum import Enum
-
 from px4_offboard.mpc_controller import MPCController
+from std_msgs.msg import Float32MultiArray
+from nav_msgs.msg import Odometry  # inner ROS2 SEKF
+
+import casadi as ca
 
 BOUNCE_TIME = 0.6
 ACCELERATE_TIME = 0.07
 BRAKE_TIME = ACCELERATE_TIME
 ARM_TIMEOUT = 5.0
 OFFBOARD_TIMEOUT = 5.0
-
 TAKEOFF_HEIGHT = -5.0
 FLIP_HEIGHT = -7.0
 
@@ -82,34 +84,21 @@ class FlipControlNode(Node):
         self.create_subscription(TrajectorySetpoint, '/fmu/out/trajectory_setpoint', self.trajectory_setpoint_callback, qos_profile)
          
         # drone_dynamics node topic
-        self.create_subscription(PoseStamped,'/quad/pose_pred',self.pose_callback, qos_profile)
+        self.create_subscription(PoseStamped,'/quad/pose_pred',self.pose_callback, qos_profile) 
+
+        self.ekf_state_sub = self.create_subscription(Float32MultiArray,'/ekf/state',self.ekf_state_callback, qos_profile)
+        self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, qos_profile)
 
         # STATE
         self.main_state = DroneState.INIT
         self.flip_state = DroneFlipState.INIT
-        self.arming_state = 0  # 0 - не армирован
-        self.nav_state = 0  # 0 - начальное состояние
-
+        self.arming_state = 0 
+        self.nav_state = 0 
         self.vehicle_status = VehicleStatus()
         self.vehicle_local_position = VehicleLocalPosition()
-        
         self.stage_time = time.time()
         self.offboard_is_active = False
   
-        #self.quaternion = np.zeros(4, dtype=np.float32) ## ОШИБКА  должна быть инициализирована как [0, 0, 0, 1]
-        self.delta_q_reset = np.zeros(4, dtype=np.float32)       # Amount by which quaternion has changed during last reset
-        
-        self.orientation_q = [0.0, 0.0, 0.0, 1.0]
-
-        self.pitch = 0.0
-        self.roll = 0.0
-        self.alt = 0.0
-
-        # DATA FROM PX4 TOPICS STARTS
-        # angular_velocity_callback
-        self.angular_velocity = np.zeros(3, dtype=np.float32)
-        self.angular_derivative = np.zeros(3, dtype=np.float32)
-
         #actuator_motors_callback
         self.torque_roll = 0.0
         self.torque_pitch = 0.0
@@ -119,16 +108,6 @@ class FlipControlNode(Node):
         self.position = np.zeros(3, dtype=np.float32) # in meters
         self.velocity = np.zeros(3, dtype=np.float32) # in meters/second
         self.acceleration = np.zeros(3, dtype=np.float32) # in meters/second^2
-
-        #vehicle_angular_acceleration_setpoint
-        self.vehicle_angular_acceleration_setpoint = np.zeros(3, dtype=np.float32)
-
-        #vehicle_sensor_combined_callback
-        self.delta_angle = np.zeros(3, dtype=np.float32)       # delta angle about the FRD body frame XYZ-axis in rad over the integration time frame (delta_angle_dt)
-        self.delta_velocity = np.zeros(3, dtype=np.float32)    # delta velocity in the FRD body frame XYZ-axis in m/s over the integration time frame (delta_velocity_dt)
-
-        self.delta_angle_dt = 0.0       # integration period in microseconds
-        self.delta_velocity_dt = 0.0    # integration period in microseconds
 
         #sensor_combined_callback
         self.q = np.array([0.0, 0.0, 0.0, 1.0])  # Начальная ориентация (кватернион, идентичность)
@@ -140,6 +119,11 @@ class FlipControlNode(Node):
         self.roll_accum = 0.0
         self.prev_roll = 0.0
         self.flip_count = 0
+
+        self.odom_callback_position = np.zeros(3, dtype=np.float32)
+        self.odom_callback_orientation = np.zeros(4, dtype=np.float32)
+        
+        self.ekf.x = np.zeros(13) # вектор состояния (13 штук: позиция, скорость, ориентация (4), угловые скорости).
 
         # Таймеры
         self.create_timer(0.1, self.update)
@@ -181,104 +165,20 @@ class FlipControlNode(Node):
 
     # callbacks start
     # ======== USED ============= 
-    def sensor_combined_callback(self, msg):
-        # === ГИРОСКОП ===
-        dt_gyro = msg.gyro_integral_dt * 1e-6  # переводим период выборки в секунды
-        gyro_rad = np.array(msg.gyro_rad)  # угловая скорость в рад/с за последний период
-        delta_angle = gyro_rad * dt_gyro # Угловое приращение за этот период времени
+    def odom_callback(self, msg: Odometry):
+        self.get_logger().info("odom_callback")
+        self.odom_callback_position = msg.pose.pose.position
+        self.odom_callback_orientation = msg.pose.pose.orientation
 
-        # Обновление ориентации
-        dq = R.from_rotvec(delta_angle)# Кватернион из углового приращения
-        q_prev = R.from_quat(self.q)  # self.q -- это предыдущая ориентация (кватернион)
-        self.sensorCombined_q = (q_prev * dq).as_quat()  # обновленная ориентация (кватернион)
-
-        self.sensorCombined_delta_angle = delta_angle  # угол поворота за период (рад)
-        self.sensorCombined_linear_acceleration = np.array(msg.accelerometer_m_s2)  # ускорение (м/с²)
-        self.sensorCombined_angular_velocity = gyro_rad
-
-    def angular_velocity_callback(self, msg):# YES
-        #self.get_logger().info("angular_velocity_callback")
-        self.angularVelocity = np.array(msg.xyz, dtype=np.float32)
-        self.angularVelocity_angular_acceleration = np.array(msg.xyz_derivative, dtype=np.float32)
-
-    def vehicle_attitude_callback(self, msg):# YES
-        #self.get_logger().info(f'vehicle_attitude_callback')
-        self.vehicleAttitude_q = np.array(msg.q, dtype=np.float32)
-        self.vehicleAttitude_delta_q_reset = np.array(msg.delta_q_reset, dtype=np.float32)
-        
-    def vehicle_angular_acceleration_setpoint_callback(self, msg):
-        self.vehiclAngularAcceleration_angular_acceleration = msg.xyz
-
-
-    def vehicle_imu_callback(self, msg):#
-        self.vehicleImu_delta_angle =  msg.delta_angle #  приращение угла (в радианах) about the FRD body frame XYZ-axis
-        self.vehicleImu_delta_velocity = msg.delta_velocity# приращение скорости (в м/с) in the FRD body frame XYZ-axis in m/s over the integration time frame (delta_velocity_dt)
-        delta_angle_dt =   msg.delta_angle_dt *  1e-6    # integration period in microseconds
-        delta_velocity_dt =  msg.delta_velocity_dt * 1e-6     # integration period in microseconds
-        self.vehicleImu_angular_velocity = self.vehicleImu_delta_angle / delta_angle_dt
-
-    # ===================== 
-    def pose_callback(self, msg):
-        # Извлекаем позицию
-        x = msg.pose.position.x
-        y = msg.pose.position.y
-        z = msg.pose.position.z
-
-        # Извлекаем кватернион
-        qx = msg.pose.orientation.x
-        qy = msg.pose.orientation.y
-        qz = msg.pose.orientation.z
-        qw = msg.pose.orientation.w
-        #self.get_logger().info(f"pose_callback {x} {y} {z} {qx} {qy} {qz}")
-
-        # Преобразуем кватернион в углы Эйлера (roll, pitch, yaw)
-        roll, pitch, yaw = tf_transformations.euler_from_quaternion([qx, qy, qz, qw])
-
-        # Логируем данные
-        self.get_logger().info(f'Position - x: {x}, y: {y}, z: {z}')
-        self.get_logger().info(f'Orientation (Euler angles) - roll: {roll}, pitch: {pitch}, yaw: {yaw}')
-
-        # Пример преобразования углов в градусы, если нужно
-        roll_deg = degrees(roll)
-        pitch_deg = degrees(pitch)
-        yaw_deg = degrees(yaw)
-        self.get_logger().info(f'Orientation in degrees - roll: {roll_deg}, pitch: {pitch_deg}, yaw: {yaw_deg}')
-
-    def odom_callback(self, msg):
-        q = msg.q  # quaternion [w, x, y, z]
-        euler = tf_transformations.euler_from_quaternion([q[1], q[2], q[3], q[0]])
-        self.roll = euler[0] * 180.0 / 3.14159
-        self.pitch = euler[1] * 180.0 / 3.14159
-        self.alt = msg.position[2]
-        #self.get_logger().info(f"ODOM_callback {self.roll} {self.pitch} {self.alt}")
-
-
-    def actuator_motors_callback(self, msg):
-        """ Управляющие моменты, которые PX4 передает в контроллер двигателя """
-        #self.get_logger().info(f'actuator_motors_callback')
-        self.torque_roll = msg.control[0]  # момент вокруг оси X (roll)
-        self.torque_pitch = msg.control[1]  # момент вокруг оси Y (pitch)
-        self.torque_yaw = msg.control[2]  # момент вокруг оси Z (yaw)
-        #self.get_logger().info(f"Torques: roll={torque_roll}, pitch={torque_pitch}, yaw={torque_yaw}")
-
-    def trajectory_setpoint_callback(self, msg):
-        #self.get_logger().info(f'trajectory_setpoint_callback')
-        self.position =  msg.position
-        self.velocity = msg.velocity
-        self.acceleration =  msg.acceleration
-
-    def vehicle_local_position_callback(self, msg):# YES
-        #self.get_logger().info(f'vehicle_local_position_callback')
-        """Callback function for vehicle_local_position topic subscriber."""
-        self.vehicle_local_position = msg
+    def ekf_state_callback(self, msg):
+        self.get_logger().info("ekf_state_callback")
+        self.ekf_x = msg.data # вектор состояния (13 штук: позиция, скорость, ориентация (4), угловые скорости).
 
     def vehicle_status_callback(self, msg):# YES
         """Обновляет состояние дрона."""
         #self.get_logger().info('vehicle_status_callback')
         self.vehicle_status = msg
         self.arming_state = msg.arming_state
- 
-    # callbacks ends
 
     # send functions
     def send_land_command(self):
@@ -411,7 +311,6 @@ class FlipControlNode(Node):
         twist.linear.z = linear_z
         twist.angular.z = angular_z
         self.publisher.publish(twist)
-    # send functions end
 
     def get_current_state(self):
         #  OR return self.droneDynamics_state # метод, возвращающий [pos, vel, q, omega]
