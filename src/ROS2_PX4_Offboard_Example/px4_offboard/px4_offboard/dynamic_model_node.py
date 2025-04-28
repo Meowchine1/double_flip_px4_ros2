@@ -8,14 +8,11 @@ from px4_msgs.msg import (VehicleAttitude, VehicleImu, ActuatorOutputs,
 import numpy as np
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from scipy.spatial.transform import Rotation as R
-
 from rclpy.time import Time
 from nav_msgs.msg import Odometry  # inner ROS2 SEKF
 from filterpy.kalman import ExtendedKalmanFilter
-
 from datetime import datetime
 from sensor_msgs.msg import Imu, MagneticField, FluidPressure
-
 import os
 import casadi as ca
 
@@ -33,158 +30,283 @@ MAX_SPEED = 2100.0
 DRAG = 0.1
 MAX_RATE = 25.0  # рад/с, ограничение на угловую скорость (roll/pitch)
 
+ 
+class iLQR:
+    def __init__(self, dynamics_func, horizon, state_dim, control_dim, dt):
+        """
+        dynamics_func: функция f(x, u, dt), принимает батчи
+        horizon: горизонт планирования (N)
+        state_dim: размерность состояния
+        control_dim: размерность управления
+        dt: шаг дискретизации
+        """
+        self.f = dynamics_func
+        self.N = horizon
+        self.n = state_dim
+        self.m = control_dim
+        self.dt = dt
+        # Целевая позиция и ориентация для флипа
+        self.target_position = np.array([0, 0, 5])  # Достигаем высоты 5 метров
 
-# Целевая позиция и ориентация для флипа
-target_position = np.array([0, 0, 5])  # Достигаем высоты 1 метр
+    def update_target_orientation(self, time_step, total_time):
+        """
+        Линейное изменение ориентации по roll от 0 до 180 градусов.
+        """
+        roll_target = time_step / total_time  # Линейное изменение от 0 до 1
+        angle = roll_target * np.pi  # от 0 до π рад (180 градусов)
+        qx = np.array([np.cos(angle/2), np.sin(angle/2), 0, 0])
+        return qx
 
-# Функция для обновления целевой ориентации в процессе флипа
-def update_target_orientation(time_step, total_time):
-    """
-    Обновляет целевую ориентацию квадрокоптера для флипа,
-    изменяя roll от 0 до 180 градусов (или от 0 до -180 для перевёрнутого положения).
-    """
-    roll_target = np.sin(np.pi * time_step / total_time)  # Синусоидальное изменение roll от 0 до 180
-    orientation = np.array([roll_target, 0, 0, 1])  # Простая аппроксимация кватерниона
-    return orientation
+    def cost_function_traj_flip(self, x_traj, u_traj, x_target_traj, u_target_traj, Q, R, total_time, time_step):
+        """
+        Функция стоимости для флипа квадрокоптера на всей траектории.
 
-def fx_linear(x, u, dt):
-    """
-    Линейная аппроксимация динамической модели квадрокоптера для iLQR.
-    Возвращает линейные матрицы A и B для системы x_next = A*x + B*u.
-    
-    x - вектор состояния [позиция, скорость, кватернион, угловая скорость]
-    u - управление (обороты моторов) [w1, w2, w3, w4] 
-    dt - шаг времени
-    """
-    m = MASS
-    I = INERTIA
-    arm = ARM_LEN
-    kf = K_THRUST
-    km = K_TORQUE
-    drag = DRAG
-    g = np.array([0, 0, 9.81])
+        x_traj - список состояний квадрокоптера на всей траектории (позиция, ориентация и угловая скорость)
+        u_traj - список управляющих воздействий (обороты моторов) на всей траектории
+        x_target_traj - список целевых состояний на всей траектории
+        u_target_traj - список целевых управляющих воздействий на всей траектории
+        Q, R - коэффициенты для ошибок положения/ориентации и управления
+        total_time - общее время траектории
+        time_step - шаг времени
+        """
 
-    # Состояние системы
-    pos = x[0:3]
-    vel = x[3:6]
-    quat = x[6:10]
-    omega = x[10:13]
+        total_cost = 0.0
+        num_steps = int(total_time / time_step)
 
-    # Нормализация кватерниона
-    quat /= np.linalg.norm(quat)
-    R_bw = R.from_quat(quat).as_matrix()  # Ориентация в матрице
+        for i in range(num_steps):
+            # Получаем текущее состояние и управление на i-м шаге
+            x = x_traj[i]
+            u = u_traj[i]
 
-    # Управление: обороты моторов
-    rpm = np.clip(u, 0, MAX_SPEED)  # Обновление оборотов моторов
-    w_squared = rpm**2
-    thrusts = kf * w_squared
-    Fz = np.array([0, 0, np.sum(thrusts)])  # Общая тяга
-    F_world = R_bw @ Fz - m * g - drag * vel  # Сила в мировой системе
+            # Получаем целевые состояние и управление на i-м шаге
+            x_target = x_target_traj[i]
+            u_target = u_target_traj[i]
 
-    # Линейные обновления
-    acc = F_world / m
-    new_vel = vel + acc * dt
-    new_pos = pos + vel * dt + 0.5 * acc * dt**2
+            # Обновляем целевую ориентацию для флипа (с изменением roll от 0 до 180 градусов)
+            target_orientation = self.update_target_orientation(i * time_step, total_time)
 
-    L = arm
-    tau = np.array([L * (thrusts[1] - thrusts[3]), 
-                    L * (thrusts[2] - thrusts[0]), 
-                    km * (w_squared[0] - w_squared[1] + w_squared[2] - w_squared[3])])
+            # Ошибка положения (позиция квадрокоптера относительно целевой позиции)
+            position_error = np.linalg.norm(x[0:3] - x_target[0:3])
 
-    omega_dot = np.linalg.inv(I) @ (tau - np.cross(omega, I @ omega))
-    new_omega = omega + omega_dot * dt
+            # Ошибка ориентации (угловая ошибка между кватернионами)
+            q_current = x[6:10] / np.linalg.norm(x[6:10])  # нормируем на всякий случай
+            q_target = target_orientation / np.linalg.norm(target_orientation)
+            dot_product = np.clip(np.dot(q_current, q_target), -1.0, 1.0)  # защита от численных ошибок
+            orientation_error = 2.0 * np.arccos(np.abs(dot_product))  # угловая ошибка в радианах
 
-    omega_quat = np.concatenate(([0.0], omega))
-    dq = 0.5 * quat_multiply(quat, omega_quat)
-    new_quat = quat + dq * dt
-    norm = np.linalg.norm(new_quat)
-    if norm > 1e-6:
-        new_quat /= norm
-    else:
-        new_quat = np.array([0, 0, 0, 1])  # fallback
+            # Ошибка управления (различие в оборотах моторов)
+            control_error = np.linalg.norm(u - u_target)
 
-    # Создаем CasADi переменные для состояния и управления
-    x_casadi = ca.MX.sym('x', 13)  # 13 переменных состояния (позиция, скорость, кватернион, угловая скорость)
-    u_casadi = ca.MX.sym('u', 4)   # 4 управляющие переменные (обороты моторов)
+            # Стоимость для текущего шага (с учётом коэффициентов Q и R)
+            step_cost = Q * (position_error**2 + orientation_error**2) + R * control_error**2
 
-    pos = x_casadi[0:3]
-    vel = x_casadi[3:6]
-    quat = x_casadi[6:10]
-    omega = x_casadi[10:13]
+            # Добавляем стоимость текущего шага к общей стоимости
+            total_cost += step_cost
 
-    quat /= ca.norm_2(quat)  # Нормализация кватерниона
-    R_bw = ca.vertcat([ca.MX([1, 0, 0]), ca.MX([0, 1, 0]), ca.MX([0, 0, 1])])  # Пример матрицы ориентации
+        return total_cost
 
-    # Управление
-    rpm = ca.clip(u_casadi, 0, MAX_SPEED)  # Обновление оборотов моторов
-    w_squared = rpm**2
-    thrusts = kf * w_squared
-    Fz = ca.MX([0, 0, ca.sum1(thrusts)])  # Общая тяга
-    F_world = ca.mtimes(R_bw, Fz) - m * g - drag * vel  # Сила в мировой системе
 
-    # Линейные обновления
-    acc = F_world / m
-    new_vel = vel + acc * dt
-    new_pos = pos + vel * dt + 0.5 * acc * dt**2
-
-    L = arm
-    tau = ca.MX([L * (thrusts[1] - thrusts[3]), 
-                 L * (thrusts[2] - thrusts[0]), 
-                 km * (w_squared[0] - w_squared[1] + w_squared[2] - w_squared[3])])
-
-    omega_dot = ca.mtimes(ca.inv(I), (tau - ca.mtimes(omega, ca.mtimes(I, omega))))
-    new_omega = omega + omega_dot * dt
-
-    # Создание матриц A и B
-    A = ca.MX.zeros(13, 13)
-    B = ca.MX.zeros(13, 4)
-
-    # Позиция и скорость
-    A[0:3, 3:6] = ca.MX.eye(3) * dt
-    A[3:6, 3:6] = -drag / m * ca.MX.eye(3) * dt
-    B[3:6, :] = ca.mtimes(ca.transpose(R_bw[:, 2]), kf * 2 * rpm).T * dt / m  # Пример для скорости
-
-    # Угловая скорость и ориентация
-    A[6:10, 10:13] = ca.MX.eye(4) * dt  # Просто примеры, их можно вычислять
-    B[6:10, :] = ca.mtimes(ca.transpose(omega_quat), kf * 2 * rpm).T * dt  # Пример для ориентации
-
-    return A, B
-
-# целевая функция
-def cost_function(x, u, x_target, u_target, Q, R, total_time, time_step):
-    # Обновляем целевую ориентацию для флипа
-    target_orientation = update_target_orientation(time_step, total_time)
-    
-    # Линейная цель: ошибка положения, ориентации и управление
-    position_error = np.linalg.norm(x[0:3] - x_target[0:3])
-    orientation_error = np.linalg.norm(x[6:10] - target_orientation)  # Ожидаем ориентацию, которая меняется с временем
-    control_error = np.linalg.norm(u - u_target)
-    
-    return Q * position_error**2 + Q * orientation_error**2 + R * control_error**2
-
-# Основной алгоритм iLQR для флипа
-def ilqr_flip(x0, u0, N, dt, Q, R):
-    X = np.zeros((N, 13))
-    U = np.zeros((N, 4))
-    X[0] = x0
-    U[0] = u0
-    
-    for iter in range(100):  # максимальное количество итераций
-        for k in range(N-1):
-            A, B = fx_linear(X[k], U[k], dt)
-            X[k+1] = np.dot(A, X[k]) + np.dot(B, U[k])
+    def fx_batch(self, x, u, dt):
+        """
+        Нелинейная модель квадрокоптера в режиме батча.
         
-        for k in range(N-1):
-            # Расчёт K-контроллера для каждого шага
-            K = np.linalg.inv(np.dot(B.T, B) + R) @ B.T
-            U[k] -= K @ (X[k] - target_position)
+        x: (B, 13) батч состояний
+        u: (B, 4) батч управлений
+        dt: скалярный шаг времени
+        return: (B, 13) новые состояния
+        """
+        # Параметры модели
+        m = MASS
+        I = INERTIA
+        arm = ARM_LEN
+        kf = K_THRUST
+        km = K_TORQUE
+        drag = DRAG
+        g = np.array([0, 0, 9.81])
+        max_speed = MAX_SPEED
+
+        B = x.shape[0]  # размер батча
+
+        pos = x[:, 0:3]
+        vel = x[:, 3:6]
+        quat = x[:, 6:10]
+        omega = x[:, 10:13]
+
+        # Нормируем кватернионы
+        quat = quat / np.linalg.norm(quat, axis=1, keepdims=True)
+
+        # Матрицы поворота (batch)
+        R_bw = R.from_quat(quat).as_matrix().reshape(B, 3, 3)
+
+        # Тяга моторов
+        rpm = np.clip(u, 0, max_speed)
+        w_squared = rpm**2
+        thrusts = kf * w_squared
+
+        Fz = np.zeros((B, 3))
+        Fz[:, 2] = np.sum(thrusts, axis=1)
+
+        F_world = np.einsum('bij,bj->bi', R_bw, Fz) - m * g - drag * vel
+        acc = F_world / m
+
+        new_vel = vel + acc * dt
+        new_pos = pos + vel * dt + 0.5 * acc * dt**2
+
+        # Моменты
+        L = arm
+        tau = np.stack([
+            L * (thrusts[:, 1] - thrusts[:, 3]),
+            L * (thrusts[:, 2] - thrusts[:, 0]),
+            km * (w_squared[:, 0] - w_squared[:, 1] + w_squared[:, 2] - w_squared[:, 3])
+        ], axis=1)
+
+        omega_cross = np.cross(omega, (I @ omega.T).T)
+        omega_dot = np.linalg.solve(I, (tau - omega_cross).T).T
+        new_omega = omega + omega_dot * dt
+
+        # Обновление кватерниона
+        omega_quat = np.concatenate([np.zeros((B,1)), omega], axis=1)
+        dq = 0.5 * self.quat_multiply_batch(quat, omega_quat)
+        new_quat = quat + dq * dt
+        new_quat = new_quat / np.linalg.norm(new_quat, axis=1, keepdims=True)
+
+        # Новый x
+        x_next = np.zeros_like(x)
+        x_next[:, 0:3] = new_pos
+        x_next[:, 3:6] = new_vel
+        x_next[:, 6:10] = new_quat
+        x_next[:, 10:13] = new_omega
+
+        return x_next
+
+    def quat_multiply_batch(self, q, r):
+        """
+        Умножение кватернионов батчем.
+        q, r: (B, 4)
+        return: (B, 4)
+        """
+        w0, x0, y0, z0 = q[:,0], q[:,1], q[:,2], q[:,3]
+        w1, x1, y1, z1 = r[:,0], r[:,1], r[:,2], r[:,3]
+        return np.stack([
+            w0*w1 - x0*x1 - y0*y1 - z0*z1,
+            w0*x1 + x0*w1 + y0*z1 - z0*y1,
+            w0*y1 - x0*z1 + y0*w1 + z0*x1,
+            w0*z1 + x0*y1 - y0*x1 + z0*w1
+        ], axis=1)
+
+    def finite_difference_jacobian_batch(self, f, x, u, dt, epsilon=1e-5):
+        n, m = x.size, u.size
+
+        # Строим батчи для x и u
+        delta_x = np.eye(n) * epsilon  # (n, n) - отклонения по состоянию
+        delta_u = np.eye(m) * epsilon  # (m, m) - отклонения по управлению
+
+        # Создаем батчи для состояний и управляющих воздействий
+        x_batch = np.vstack((x + delta_x, x - delta_x))  # (2n, n)
+        u_batch = np.vstack((u + delta_u, u - delta_u))  # (2m, m)
+
+         
+        x_batch = np.vstack([x + delta_x, x - delta_x])  # (2n, n)
+        u_batch = np.vstack([u + delta_u, u - delta_u])  # (2m, m)
+
+        # Один вызов функции для всех perturbations
+        f_batch = f(x_batch, u_batch, dt)  # (2n * 2m, ...) - выход из функции динамики
+
+        # Разделяем на части для вычисления A и B
+        f_x = f_batch[:2 * n]  # Результаты для изменения x
+        f_u = f_batch[2 * n:]  # Результаты для изменения u
         
-        # Проверка на сходимость (ошибка должна уменьшаться)
-        if np.linalg.norm(X[-1] - target_position) < 1e-3:
-            print("Конвергенция достигнута на итерации:", iter)
-            break
-    
-    return X, U
+        # Вычисление Якобиана A (df/dx)
+        A = (f_x[:n] - f_x[n:]) / (2 * epsilon)
+        A = A.T  # Транспонируем, чтобы соответствовать размерности
+
+        # Вычисление Якобиана B (df/du)
+        B = (f_u[:m] - f_u[m:]) / (2 * epsilon)
+        B = B.T  # Транспонируем для соответствия размерности
+
+        return A, B
+
+
+    def solve(self, x0, u_init, Q, R, Qf, x_goal, max_iter=100, tol=1e-6):
+        """
+        Основной цикл iLQR с использованием полной функции стоимости по траектории.
+        """
+
+        N = self.N
+        n = self.n
+        m = self.m
+
+        u_traj = u_init.copy()
+        x_traj = np.zeros((N, n))
+        x_traj[0] = x0
+
+        for k in range(N-1):
+            x_traj[k+1] = self.f(x_traj[k:k+1], u_traj[k:k+1], self.dt)[0]
+
+        prev_cost = self.cost_function(x_traj, u_traj, x_goal, Q, R, Qf)
+
+        for iteration in range(max_iter):
+            A_list = []
+            B_list = []
+
+            for k in range(N-1):
+                A, B = self.finite_difference_jacobian_batch(self.f, x_traj[k], u_traj[k], self.dt)
+                A_list.append(A)
+                B_list.append(B)
+
+            # Backward pass
+            Vx = Qf @ (x_traj[-1] - x_goal)
+            Vxx = Qf.copy()
+
+            K_list = []
+            d_list = []
+
+            for k in reversed(range(N-1)):
+                A = A_list[k]
+                B = B_list[k]
+
+                Qx = Q @ (x_traj[k] - x_goal) + A.T @ Vx
+                Qu = R @ u_traj[k] + B.T @ Vx
+                Qxx = Q + A.T @ Vxx @ A
+                Quu = R + B.T @ Vxx @ B
+                Qux = B.T @ Vxx @ A
+
+                # Решаем Quu * du = -Qu
+                du = -np.linalg.solve(Quu, Qu)
+                K = -np.linalg.solve(Quu, Qux)
+
+                K_list.insert(0, K)
+                d_list.insert(0, du)
+
+                Vx = Qx + K.T @ Quu @ du + K.T @ Qu + Qux.T @ du
+                Vxx = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
+
+            # Forward pass (линейная коррекция)
+            x_new = np.zeros_like(x_traj)
+            u_new = np.zeros_like(u_traj)
+
+            x_new[0] = x0
+
+            for k in range(N-1):
+                du = d_list[k] + K_list[k] @ (x_new[k] - x_traj[k])
+                u_new[k] = u_traj[k] + du
+                x_new[k+1] = self.f(x_new[k:k+1], u_new[k:k+1], self.dt)[0]
+
+            # Новая стоимость по всей траектории
+            cost = self.cost_function(x_new, u_new, x_goal, Q, R, Qf)
+
+            if iteration > 0 and abs(prev_cost - cost) < tol:
+                print(f'Converged at iteration {iteration}, cost: {cost}')
+                break
+
+            prev_cost = cost
+            x_traj = x_new
+            u_traj = u_new
+
+        return x_traj, u_traj
+
+ 
+
 
 # Функция для MPC
 def mpc_controller(x_current, N, dt, Q, R, target_position):
@@ -200,7 +322,7 @@ def mpc_controller(x_current, N, dt, Q, R, target_position):
 
     return U_mpc
 
-def start_ilqr():
+def start_flip():
     # Начальные условия для флипа
     x0 = np.array([0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])  # Начальная позиция и ориентация
     u0 = np.array([1000, 1000, 1000, 1000])  # Начальные обороты моторов
@@ -244,9 +366,8 @@ class MyEKF(ExtendedKalmanFilter):
     def predict_x(self, u=np.zeros(4)):
         # Custom fx(x, u, dt) function
         return self.fx(self.x, u, self.dt)
-    
     #predict new state with dynamic physic model
-    def fx(self, x, u, dt):
+    def fx(self,x, u, dt):
         """
         Нелинейная динамическая модель квадрокоптера
         dt - шаг времени
@@ -308,6 +429,7 @@ class MyEKF(ExtendedKalmanFilter):
         x_next[6:10] = new_quat
         x_next[10:13] = new_omega
         return x_next
+
 
 class DynamicModelNode(Node):
     def __init__(self):

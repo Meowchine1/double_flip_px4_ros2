@@ -452,8 +452,6 @@ class FlipControlNode(Node):
         elif self.main_state == DroneState.LANDING:
             self.publish_position_setpoint(0.0, 0.0, 1.0)
 
-
-
 def main(args=None):
     rclpy.init(args=args)
     node = FlipControlNode()
