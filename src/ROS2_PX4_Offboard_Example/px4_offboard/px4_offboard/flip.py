@@ -18,6 +18,9 @@ from px4_offboard.mpc_controller import MPCController
 from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Odometry  # inner ROS2 SEKF
 from std_msgs.msg import String
+
+from quad_flip_interfaces.msg import OptimizedTraj
+
 BOUNCE_TIME = 0.6
 ACCELERATE_TIME = 0.07
 BRAKE_TIME = ACCELERATE_TIME
@@ -56,15 +59,7 @@ class FlipControlNode(Node):
         self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile) 
         self.create_subscription(ActuatorMotors, '/fmu/out/actuator_motors', self.actuator_motors_callback, qos_profile)
         self.create_subscription(TrajectorySetpoint, '/fmu/out/trajectory_setpoint', self.trajectory_setpoint_callback, qos_profile)
-         
-        self.create_subscription(Vector3, '/drone/optimized_traj', self.optimized_traj_callback, qos_profile)
-        self.target_u, self.target_x = [], []
-        self.create_subscription(String, '/drone/mpc_data', self.mpc_data_callback, qos_profile)
-        self.takeoff_alt = 0.0
-        self.mpc_takeoff = False
-        self.mpc_flip = False 
-        self.pub_to_mpc = self.create_publisher(Vector3, '/drone/client_data', qos_profile)
-    
+       
         # == == == =STATE CONTROL= == == == 
         self.main_state = DroneState.INIT
         
@@ -84,9 +79,32 @@ class FlipControlNode(Node):
         self.flip_thrust_max_f = False
         self.flip_thrust_recovery_f = False
         self.flip_pitch_f = False
+
+        # MPC INTEGRATION API
+        self.pub_to_mpc = self.create_publisher(String, '/drone/client_msg', qos_profile)#
+
+        self.create_subscription(OptimizedTraj, '/drone/optimized_traj', self.optimized_traj_callback, qos_profile)
+        self.X_opt = np.zeros((self.horizon + 1, self.n))  # (N+1) x n
+        self.u_optimal = np.zeros((self.horizon, self.m))  # N x m
+        self.i_final = 0
+        self.cost_final = 0.0
+
+        self.create_subscription(Vector3, '/drone/mpc_data', self.mpc_data_callback, qos_profile)
+        self.target_u, self.target_x = [], []
+         
+        self.takeoff_alt = 0.0
+        self.mpc_takeoff = False
+        self.mpc_flip = False 
  
     def optimized_traj_callback(self, msg):
-        self.target_u, self.target_x = msg.data[0],msg.data[1]
+        x_dim = self.n   # например, размерность состояния
+        u_dim = self.m   # размерность управления
+        T = self.horizon # длина горизонта
+
+        self.X_opt = np.array(msg.x_opt, dtype=np.float32).reshape(T + 1, x_dim)
+        self.u_optimal = np.array(msg.u_opt, dtype=np.float32).reshape(T, u_dim)
+        self.i_final = msg.i_final
+        self.cost_final = msg.cost_final
     
     def mpc_data_callback(self, msg):
         self.takeoff_alt = msg.data[0]
@@ -94,11 +112,15 @@ class FlipControlNode(Node):
         self.mpc_flip = msg.data[2]
 
     
-    def send_to_mpc(self, msg):
+    def send_message(self, msg):#
         ros_msg = String()
         ros_msg.data = msg
         self.pub_to_mpc.publish(ros_msg)
         #self.get_logger().info(f'Sent to MPC: {msg}')
+
+    def get_control_from_mpc(self):
+        pass
+
 
     def vehicle_status_callback(self, msg): 
         """Обновляет состояние дрона."""
@@ -235,6 +257,7 @@ class FlipControlNode(Node):
             #self.set_rates(17.0, 0.0, 0.0, 0.25)# roll_max_rate should be 1000 in QGC vechicle setup
             self.set_rates(25.0, 0.0, 0.0, 0.25)
 
+     
     # main spinned function
     def update(self):
         #self.get_logger().info(f"self.main_state={self.main_state}  self.flip_state={self.flip_state}")
@@ -250,7 +273,7 @@ class FlipControlNode(Node):
             if self.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self.get_logger().info('ARMING_STATE_ARMED')
                 self.main_state = DroneState.TAKEOFF
-                self.send_to_mpc("takeoff")#
+                self.send_message("takeoff")#
             else:
                 self.set_offboard_mode()
                 self.arm()

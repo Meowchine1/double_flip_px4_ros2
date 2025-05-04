@@ -19,9 +19,14 @@ import casadi as ca
 
 import matplotlib.pyplot as plt
 from std_msgs.msg import String
-
+ 
+ 
+from jax import grad,  jit, lax 
 import jax
 import jax.numpy as jnp
+from jax import grad, jacobian, hessian
+
+from quad_flip_interfaces.msg import OptimizedTraj
 
 # ======= CONSTANTS =======
 SEA_LEVEL_PRESSURE = 101325.0
@@ -36,6 +41,52 @@ MOTOR_TAU = 0.02
 MAX_SPEED = 2100.0
 DRAG = 0.1
 MAX_RATE = 25.0  # рад/с, ограничение на угловую скорость (roll/pitch)
+
+def f(self, x, u, dt):
+    m = MASS
+    I = INERTIA
+    arm = ARM_LEN
+    kf = K_THRUST
+    km = K_TORQUE
+    drag = DRAG  # единственный коэффициент сопротивления
+    g = jnp.array([0.0, 0.0, 9.81])
+    max_speed = MAX_SPEED
+
+    pos = x[0:3]
+    vel = x[3:6]
+    quat = x[6:10] / (jnp.linalg.norm(x[6:10]) + 1e-8)
+    omega = x[10:13]
+
+    R_bw = jnp.array(R.from_quat(quat).as_matrix())
+
+    rpm = jnp.clip(u, 0.0, max_speed)
+    w_squared = rpm ** 2
+    thrusts = kf * w_squared
+
+    Fz_body = jnp.array([0.0, 0.0, jnp.sum(thrusts)])
+    F_world = R_bw @ Fz_body - m * g - drag * vel  # линейное сопротивление
+    acc = F_world / m
+
+    new_vel = vel + acc * dt
+    new_pos = pos + vel * dt + 0.5 * acc * dt ** 2
+
+    tau = jnp.array([
+        arm * (thrusts[1] - thrusts[3]),
+        arm * (thrusts[2] - thrusts[0]),
+        km * (w_squared[0] - w_squared[1] + w_squared[2] - w_squared[3])
+    ])
+
+    omega_cross = jnp.cross(omega, I @ omega)
+    omega_dot = jnp.linalg.solve(I, tau - omega_cross)
+    new_omega = omega + omega_dot * dt
+
+    omega_quat = jnp.concatenate([jnp.array([0.0]), omega])
+    dq = 0.5 * self.quat_multiply(quat, omega_quat)
+    new_quat = quat + dq * dt
+    new_quat /= jnp.linalg.norm(new_quat + 1e-8)
+
+    x_next = jnp.concatenate([new_pos, new_vel, new_quat, new_omega])
+    return x_next
 
 def plot_trajectory(x_traj_opt, x_goal=None, title="Optimized Trajectory"):
     x = x_traj_opt[:, 0]
@@ -81,35 +132,7 @@ def publish_trajectory_marker(pub, x_traj_opt, frame_id="map"):
 
     # self.traj_pub = self.create_publisher(Marker, "/mpc/trajectory", 10)
     #publish_trajectory_marker(self.traj_pub, x_traj_opt)
-
-# def __init__(self):
-#         super().__init__('mpc_controller')
-        
-#         self.traj_pub = self.create_publisher(Marker, "/mpc/trajectory", 10)
-
-#         # Остальные инициализации...
-
-#     def publish_trajectory_marker(self, x_traj_opt, frame_id="map"):
-#         marker = Marker()
-#         marker.header.frame_id = frame_id
-#         marker.header.stamp = self.get_clock().now().to_msg()
-#         marker.ns = "mpc_trajectory"
-#         marker.id = 0
-#         marker.type = Marker.LINE_STRIP
-#         marker.action = Marker.ADD
-#         marker.scale.x = 0.02
-#         marker.color.a = 1.0
-#         marker.color.r = 0.0
-#         marker.color.g = 0.7
-#         marker.color.b = 1.0
-
-#         for state in x_traj_opt:
-#             p = Point()
-#             p.x, p.y, p.z = state[:3]
-#             marker.points.append(p)
-
-#         self.traj_pub.publish(marker)
-
+ 
 # ===== MATRIX OPERTIONS =====
 # QUATERNION UTILS (SCIPY-based)
 def quat_multiply(q1, q2):
@@ -123,84 +146,19 @@ class MyEKF(ExtendedKalmanFilter):
         self.get_logger().info(f"MyEKF")
         super().__init__(dim_x, dim_z)
         self.dt = EKF_DT
+        self.f = f
 
     def predict_x(self, u=np.zeros(4)):
         # Custom fx(x, u, dt) function
-        return self.fx(self.x, u, self.dt)
+        return self.f(self.x, u, self.dt)
     #predict new state with dynamic physic model
-    def fx(self,x, u, dt):
-        """
-        Нелинейная динамическая модель квадрокоптера
-        dt - шаг времени
-        x - вектор состояния [позиция, скорость, кватернион, угловая скорость]
-        u - управление (обороты моторов) [w1, w2, w3, w4] 
-        """
-        # параметры
-        m = MASS
-        I = INERTIA
-        arm = ARM_LEN
-        kf = K_THRUST
-        km = K_TORQUE
-        drag = DRAG
-        g = np.array([0, 0, 9.81])
-        max_rate = MAX_RATE
-        max_speed = MAX_SPEED
-
-        pos = x[0:3]
-        vel = x[3:6]
-        quat = x[6:10]
-        omega = x[10:13]
-
-        quat /= np.linalg.norm(quat)
-        R_bw = R.from_quat(quat).as_matrix()  # Перевод ориентации в матрицу
-        rpm = np.clip(u, 0, max_speed) # Вычисляем тягу каждого мотора
-        w_squared = rpm**2
-        thrusts = kf * w_squared
-        Fz = np.array([0, 0, np.sum(thrusts)]) # Общая тяга в теле
-        F_world = R_bw @ Fz - m * g - drag * vel # Сила в мировой системе с компенсацией гравитации и сопротивления
-
-        # Обновление линейной скорости и позиции
-        acc = F_world / m # ускорение в мировой ск, второй закон ньютона
-        new_vel = vel + acc * dt
-        new_pos = pos + vel * dt + 0.5 * acc * dt**2
-
-        # Моменты (упрощённо: крестовина)
-        L = arm
-        tau = np.array([L * (thrusts[1] - thrusts[3]),
-                        L * (thrusts[2] - thrusts[0]),
-                        km * (w_squared[0] - w_squared[1] + w_squared[2] - w_squared[3]) ])
-        # Обновление угловой скорости (Жуковский)
-        omega_dot = np.linalg.inv(I) @ (tau - np.cross(omega, I @ omega))
-        new_omega = omega + omega_dot * dt
-
-        # Обновление ориентации через кватернион
-        omega_quat = np.concatenate(([0.0], omega))
-        dq = 0.5 * quat_multiply(quat, omega_quat)
-        new_quat = quat + dq * dt
-        norm = np.linalg.norm(new_quat)
-        if norm > 1e-6:
-            new_quat /= norm
-        else:
-            new_quat = np.array([0, 0, 0, 1]) # fallback
-
-        # Новое состояние
-        x_next = np.zeros(13)
-        x_next[0:3] = new_pos
-        x_next[3:6] = new_vel
-        x_next[6:10] = new_quat
-        x_next[10:13] = new_omega
-        return x_next
+     
 
 class DynamicModelNode(Node):
     def __init__(self):
         super().__init__('dynamic_model_node')
         
-        self.get_logger().info(f"DynamicModelNode")
-
-        # == == == =CLIENT SERVER INTERACTION= == == ==
-        self.pub_optimized_traj = self.create_publisher(Vector3, '/drone/optimized_traj', qos_profile)
-        self.pub_to_client = self.create_publisher(Vector3, '/drone/mpc_data', qos_profile)
-        self.create_subscription(String, '/drone/client_data', self.client_data_callback, qos_profile)
+        self.get_logger().info(f"DynamicModelNode") 
 
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -316,11 +274,14 @@ class DynamicModelNode(Node):
 
         self.phase = 'init'
         self.takeoff_altitude = 5.0  # м
+        self.takeoff_tol = 0.1
         self.flip_started_time = None
         self.flip_duration = 1.0  # с, продолжительность флипа
-        self.hover_time = 2.0  # с, стабилизация после флипа
-        self.hover_start_time = None
+        self.recovery_time = 2.0  # с, стабилизация после флипа
+        self.recovery_start_time = None
         self.landing_altitude = 0.2  # м
+        # Переход в посадку — по ориентации
+        self.roll_abs_tol = 0.1  # допуск 0.1 рад
         #   ====    ====    ====     ====     ====
 
         now_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -334,18 +295,35 @@ class DynamicModelNode(Node):
         self.EKF_timer = self.create_timer(EKF_DT, self.EKF)
         self.ekf_filter_node_timer = self.create_timer(0.01, self.ekf_filter_node_t) 
         self.mpc_controller = self.create_timer(0.01, self.mpc_control_loop)
+         
+
+        # == == == =CLIENT SERVER INTERACTION= == == == 
+        self.create_subscription(String, '/drone/client_msg', self.client_msg_callback, qos_profile)#
+
+        self.pub_optimized_traj = self.create_publisher(OptimizedTraj, '/drone/optimized_traj', qos_profile)
         #self.optimized_traj = self.create_timer(EKF_DT, self.send_optimized_traj_t)
         self.optimized_traj_f = False
+        self.X_opt = np.zeros((self.horizon + 1, self.n))  # (N+1) x n
+        self.u_optimal = np.zeros((self.horizon, self.m))  # N x m
+        self.i_final = 0
+        self.cost_final = 0.0
+        self.done = False
+
+
         self.to_client = self.create_timer(EKF_DT, self.to_client_t)
         self.to_client_f = False
  
-    def to_client_t(self):
-        if self.to_client_f:
-            msg = None
-            msg[0] = self.ekf.x[2] # altitude
-            self.pub_to_client.publish(msg)
+    def send_optimized_traj(self):
+        if self.optimized_traj_f:
+            msg = OptimizedTraj()
+            msg.x_opt = np.asarray(self.X_opt).flatten().astype(np.float32).tolist()
+            msg.u_opt = np.asarray(self.u_optimal).flatten().astype(np.float32).tolist()
+            msg.i_final = int(self.i_final)
+            msg.cost_final = float(self.cost_final)
+            msg.done = self.done
+            self.pub_optimized_traj.publish(msg)
 
-    def client_data_callback(self, msg):
+    def client_msg_callback(self, msg):#
         """GET CLIENT MESSAGES"""
         command = msg.data.strip().lower()
         self.get_logger().info(f"Received command: {command}")
@@ -377,14 +355,7 @@ class DynamicModelNode(Node):
             marker.points.append(p)
 
         pub.publish(marker)
-    
-    def send_optimized_traj(self):
-        if self.optimized_traj_f:
-            msg = None
-            msg[0] = self.x_goal
-            msg[1] = self.u_target_traj 
-            self.pub_optimized_traj.publish(msg)
-
+     
     def quaternion_from_roll(self, roll_rad):
         r = R.from_euler('x', roll_rad)
         return r.as_quat()  # формат [x, y, z, w]
@@ -398,53 +369,6 @@ class DynamicModelNode(Node):
             u_target_traj = np.zeros((self.horizon, 4))   # 4 — управляющие усилия
 
             if self.phase == 'takeoff':
-                pos = x0[0:3].copy()
-                pos[2] = self.takeoff_altitude
-                vel = np.zeros(3)
-                q = np.array([0.0, 0.0, 0.0, 1.0])  # Нулевая ориентация
-                omega = np.zeros(3)
-                x_target_traj[i] = np.concatenate([pos, vel, q, omega])
-                u_target_traj[i] = self.hover_thrust.copy()
-
-                if self.ekf.x[2] + 0.5 >= self.takeoff_altitude:
-                    self.phase = 'flip'
-                    self.flip_started_time = current_time
-
-            elif self.phase == 'flip':
-                # Фаза флипа вокруг оси X
-                t_local = current_time - self.flip_started_time
-
-                # Оценка текущего угла roll из кватерниона EKF
-                q_current = self.ekf.x[6:10]  # qx, qy, qz, qw
-                roll_current, _, _ = self.euler_from_quaternion(q_current)
-
-                # Целевой угол на текущий момент времени (плановая траектория)
-                roll_time_based = 2 * np.pi * (t_local / self.flip_duration)
-
-                # Добавим корректировку на недолет или перелет
-                roll_error = roll_time_based - roll_current
-                gain = 0.5  # коэффициент обратной связи — можно подстроить под модель
-                roll_target = roll_current + gain * roll_error
-
-
-                # Уточнённый угол поворота
-                angle_i = roll_target * (i / self.horizon)
-
-                pos = x0[0:3]
-                vel = np.zeros(3)
-                q = self.quaternion_from_roll(angle_i)
-                omega = np.array([2 * np.pi / self.flip_duration, 0.0, 0.0])
-
-                x_target_traj[i] = np.concatenate([pos, vel, q, omega])
-                u_target_traj[i] = self.hover_thrust.copy()
-
-                # Завершаем флип по углу или по времени
-                if abs(roll_current) >= 2 * np.pi or t_local >= self.flip_duration:
-                    self.phase = 'hover'
-                    self.hover_start_time = current_time
-
-            elif self.phase == 'hover':
-                # Стабилизация после флипа
                 for i in range(self.horizon):
                     pos = x0[0:3].copy()
                     pos[2] = self.takeoff_altitude
@@ -452,28 +376,91 @@ class DynamicModelNode(Node):
                     q = np.array([0.0, 0.0, 0.0, 1.0])  # Нулевая ориентация
                     omega = np.zeros(3)
                     x_target_traj[i] = np.concatenate([pos, vel, q, omega])
-                    u_target_traj[i] = self.hover_thrust.copy()
+                    u_target_traj[i] = self.recovery_thrust.copy()
 
-                if current_time - self.hover_start_time >= self.hover_time:
+                if abs(self.ekf.x[2] - self.takeoff_altitude) < self.takeoff_tol:
+                    self.phase = 'flip'
+                    self.flip_started_time = current_time
+
+            elif self.phase == 'flip':
+                t_local = current_time - self.flip_started_time
+                t_local = np.clip(t_local, 0.0, self.flip_duration)
+
+                roll_expected = 2 * np.pi * t_local / self.flip_duration
+                q_current = self.ekf.x[6:10]
+                roll_current, _, _ = self.euler_from_quaternion(q_current)
+                roll_error = roll_expected - roll_current
+
+                # Усиливаем целевой roll, если отстаём
+                gain_base = 0.8
+                gain_adaptive = gain_base + 0.3 * np.tanh(roll_error)
+                roll_target = roll_current + gain_adaptive * roll_error
+
+                for i in range(self.horizon):
+                    alpha_i = i / self.horizon
+                    angle_i = roll_target * alpha_i
+
+                    pos = x0[0:3]
+                    vel = np.zeros(3)
+                    q = self.quaternion_from_roll(angle_i)
+
+                    # Усилить угловую скорость, если ошибка нарастает
+                    omega_magnitude = 2 * np.pi / self.flip_duration + 0.2 * roll_error
+                    omega = np.array([omega_magnitude, 0.0, 0.0])
+
+                    x_target_traj[i] = np.concatenate([pos, vel, q, omega])
+                    u_target_traj[i] = self.recovery_thrust.copy()
+
+                # Завершение флипа
+                if abs(roll_current) >= 2 * np.pi * 0.95:  # добавим зазор
+                    self.phase = 'recovery'
+                    self.recovery_start_time = current_time 
+
+            elif self.phase == 'recovery':
+                t_local = current_time - self.recovery_start_time
+                t_local = np.clip(t_local, 0.0, self.recovery_time)
+
+                roll_desired = 2 * np.pi * (1 - t_local / self.recovery_time)
+                q_current = self.ekf.x[6:10]
+                roll_current, _, _ = self.euler_from_quaternion(q_current)
+
+                roll_error = roll_desired - roll_current
+                gain = 0.6 + 0.4 * (abs(roll_error) / np.pi)  # адаптивное усиление
+
+                roll_target = roll_current + gain * roll_error
+
+                for i in range(self.horizon):
+                    alpha_i = i / self.horizon
+                    angle_i = roll_current + alpha_i * (roll_target - roll_current)
+
+                    pos = x0[0:3].copy()
+                    vel = np.zeros(3)
+                    q = self.quaternion_from_roll(angle_i)
+
+                    # Модифицируем omega в зависимости от текущей ошибки
+                    omega_mag = -2 * np.pi / self.recovery_time * (1 + 0.2 * abs(roll_error) / np.pi)
+                    omega = np.array([omega_mag, 0.0, 0.0])
+
+                    x_target_traj[i] = np.concatenate([pos, vel, q, omega])
+                    u_target_traj[i] = self.recovery_thrust.copy()
+
+                if abs(roll_current) <= self.roll_abs_tol:
                     self.phase = 'land'
 
             elif self.phase == 'land':
                 self.to_client_f = False
                 self.optimized_traj_f = False
+                self.done = True
 
             # Вызов MPC
-            x_traj_opt, u_mpc = self.mpc.step(
+            self.X_opt, self.u_optimal, self.i_final, self.cost_final = self.mpc.step(
                 t=current_time,
                 x0=x0,
                 u_init=u_init,
-                x_goal=x_target_traj[-1],
+                x_target_traj=x_target_traj[-1],
                 u_target_traj=u_target_traj,
             )
-
-            self.send_optimized_traj_t(x_traj_opt, u_mpc)
-
-            # visualize trajectory
-            publish_trajectory_marker(self.traj_pub, x_traj_opt)
+            publish_trajectory_marker(self.traj_pub, self.X_opt)
 
     def ekf_filter_node_t(self):
         self.get_logger().info("ekf_filter_node_t")
@@ -775,276 +762,101 @@ def predict_flip_success(x_init, u_init, duration=2.0):
     return True 
 
 
-# итеративный оптимизатор управления для квадрокоптера
 class ILQROptimizer:
-    def __init__(self, horizon, state_dim, control_dim, dt):
-        """
-        dynamics_func: функция f(x, u, dt), принимает батчи
-        horizon: горизонт планирования (N)
-        state_dim: размерность состояния
-        control_dim: размерность управления
-        dt: шаг дискретизации
-        """
-        self.f = self.fx_batch
-        self.N = horizon
-        self.n = state_dim
-        self.m = control_dim
+    def __init__(self, dynamics_func, cost_function_traj_flip, N, n, m, dt):
+        self.f = dynamics_func
+        self.cost_function_traj_flip = cost_function_traj_flip
+        self.N = N
+        self.n = n
+        self.m = m
         self.dt = dt
-        # Целевая позиция и ориентация для флипа
-        self.target_position = np.array([0, 0, 5])  # Достигаем высоты 5 метров
- 
-    def cost_function_traj_flip(self, x_traj, u_traj, x_target_traj, u_target_traj, Q, R, Qf, total_time, time_step):
-        """
-        Функция стоимости для флипа квадрокоптера на всей траектории.
-        Вычисляет общую стоимость движения по всей траектории флипа дрона, 
-        включая терминальную (финальную) стоимость.
 
-        x_traj - список состояний квадрокоптера на всей траектории (позиция, ориентация и угловая скорость)
-        u_traj - список управляющих воздействий (обороты моторов) на всей траектории
-        x_target_traj - список целевых состояний на всей траектории
-        u_target_traj - список целевых управляющих воздействий на всей траектории
-        Q,Qf,R - коэффициенты для ошибок положения/ориентации и управления
-        Q, R — скаляры, а Qf — матрица, применимая в терминале как квадратичная форма:
-        total_time - общее время траектории
-        time_step - шаг времени
-        """
+    def simulate_trajectory(self, x0, U):
+        X = [x0]
+        x = x0
+        for u in U:
+            x = self.f(x, u, self.dt)
+            X.append(x)
+        return jnp.stack(X)
 
-        total_cost = 0.0
-        num_steps = int(total_time / time_step)
-
-        for i in range(num_steps - 1):  # обычные шаги
-            x = x_traj[i]
-            u = u_traj[i]
-            x_target = x_target_traj[i]
-            u_target = u_target_traj[i]
-
-            position_error = np.linalg.norm(x[0:3] - x_target[0:3])
-            q_current = x[6:10] / np.linalg.norm(x[6:10])
-            q_target = x_target[6:10] / np.linalg.norm(x_target[6:10])
-            dot_product = np.clip(np.dot(q_current, q_target), -1.0, 1.0)
-            orientation_error = 2.0 * np.arccos(np.abs(dot_product))
-            control_error = np.linalg.norm(u - u_target)
-
-            step_cost = Q * (position_error**2 + orientation_error**2) + R * control_error**2
-            total_cost += step_cost
-
-        # Терминальная стоимость
-        x_final = x_traj[num_steps - 1]
-        x_final_target = x_target_traj[num_steps - 1]
-        terminal_error = x_final - x_final_target
-        terminal_cost = terminal_error.T @ Qf @ terminal_error
-        total_cost += terminal_cost
-
-        return total_cost
-
-    def fx_batch(self, x, u, dt):
-        """
-        Нелинейная модель квадрокоптера в режиме батча.
-        
-        x: (B, 13) батч состояний
-        u: (B, 4) батч управлений
-        dt: скалярный шаг времени
-        return: (B, 13) новые состояния
-        """
-        # Параметры модели
-        m = MASS
-        I = INERTIA
-        arm = ARM_LEN
-        kf = K_THRUST
-        km = K_TORQUE
-        drag = DRAG
-        g = np.array([0, 0, 9.81])
-        max_speed = MAX_SPEED
-
-        B = x.shape[0]  # размер батча
-
-        pos = x[:, 0:3]
-        vel = x[:, 3:6]
-        quat = x[:, 6:10]
-        omega = x[:, 10:13]
-
-        # Нормируем кватернионы
-        quat = quat / np.linalg.norm(quat, axis=1, keepdims=True)
-
-        # Матрицы поворота (batch)
-        R_bw = R.from_quat(quat).as_matrix().reshape(B, 3, 3)
-
-        # Тяга моторов
-        rpm = np.clip(u, 0, max_speed)
-        w_squared = rpm**2
-        thrusts = kf * w_squared
-
-        Fz = np.zeros((B, 3))
-        Fz[:, 2] = np.sum(thrusts, axis=1)
-
-        F_world = np.einsum('bij,bj->bi', R_bw, Fz) - m * g - drag * vel
-        acc = F_world / m
-
-        new_vel = vel + acc * dt
-        new_pos = pos + vel * dt + 0.5 * acc * dt**2
-
-        # Моменты
-        L = arm # расстояние от центра масс до мотора (плечо рычага).
-        tau = np.stack([
-            L * (thrusts[:, 1] - thrusts[:, 3]), # τ_roll   = L * (F2 - F4)
-            L * (thrusts[:, 2] - thrusts[:, 0]), # τ_pitch  = L * (F3 - F1)
-            km * (w_squared[:, 0] - w_squared[:, 1] + w_squared[:, 2] - w_squared[:, 3]) # τ_yaw
-        ], axis=1)
-
-        omega_cross = np.cross(omega, (I @ omega.T).T)
-        omega_dot = np.linalg.solve(I, (tau - omega_cross).T).T
-        new_omega = omega + omega_dot * dt
-
-        # Обновление кватерниона
-        omega_quat = np.concatenate([np.zeros((B,1)), omega], axis=1)
-        dq = 0.5 * self.quat_multiply_batch(quat, omega_quat)
-        new_quat = quat + dq * dt
-        new_quat = new_quat / np.linalg.norm(new_quat, axis=1, keepdims=True)
-
-        # Новый x
-        x_next = np.zeros_like(x)
-        x_next[:, 0:3] = new_pos
-        x_next[:, 3:6] = new_vel
-        x_next[:, 6:10] = new_quat
-        x_next[:, 10:13] = new_omega
-
-        return x_next
-
-    def quat_multiply_batch(self, q, r):
-        """
-        Умножение кватернионов батчем.
-        q, r: (B, 4)
-        return: (B, 4)
-        """
-        w0, x0, y0, z0 = q[:,0], q[:,1], q[:,2], q[:,3]
-        w1, x1, y1, z1 = r[:,0], r[:,1], r[:,2], r[:,3]
-        return np.stack([
-            w0*w1 - x0*x1 - y0*y1 - z0*z1,
-            w0*x1 + x0*w1 + y0*z1 - z0*y1,
-            w0*y1 - x0*z1 + y0*w1 + z0*x1,
-            w0*z1 + x0*y1 - y0*x1 + z0*w1
-        ], axis=1)
-
-    def finite_difference_jacobian_batch(self, f, x, u, dt, epsilon=1e-5):
-        """
-        Численно приближает Якобианы динамической модели 
-        по состоянию A = df/dx и по управлению B = df/du 
-        методом конечных разностей.
-
-        Порождает батчи слегка возмущённых x и u.
-        Вызывает модель f() для всех возмущённых данных.
-        Вычисляет разности и делит на 2*epsilon, что реализует центральную разностную аппроксимацию.
-        """
-        n, m = x.size, u.size
-
-        # Строим батчи для x и u
-        delta_x = np.eye(n) * epsilon  # (n, n) - отклонения по состоянию
-        delta_u = np.eye(m) * epsilon  # (m, m) - отклонения по управлению
-
-        # Создаем батчи для состояний и управляющих воздействий
-        x_batch = np.vstack((x + delta_x, x - delta_x))  # (2n, n)
-        u_batch = np.vstack((u + delta_u, u - delta_u))  # (2m, m)
-
-        # Один вызов функции для всех perturbations
-        f_batch = f(x_batch, u_batch, dt)  # (2n * 2m, ...) - выход из функции динамики
-
-        # Разделяем на части для вычисления A и B
-        f_x = f_batch[:2 * n]  # Результаты для изменения x
-        f_u = f_batch[2 * n:]  # Результаты для изменения u
-        
-        # Вычисление Якобиана A (df/dx)
-        A = (f_x[:n] - f_x[n:]) / (2 * epsilon)
-        A = A.T  # Транспонируем, чтобы соответствовать размерности
-
-        # Вычисление Якобиана B (df/du)
-        B = (f_u[:m] - f_u[m:]) / (2 * epsilon)
-        B = B.T  # Транспонируем для соответствия размерности
-
+    def linearize_dynamics(self, x, u):
+        A = jacobian(self.f, argnums=0)(x, u, self.dt)
+        B = jacobian(self.f, argnums=1)(x, u, self.dt)
         return A, B
 
-    def solve(self, x0, u_init, Q, R, Qf, x_goal, u_target_traj, max_iter=100, tol=1e-6):
-        """
-        Основной метод решения задачи оптимального управления с помощью iLQR. 
-        Он минимизирует функцию стоимости, корректируя управляющие воздействия.
+    def quadratize_cost(self, x, u, x_target, u_target, Q, R):
+        lx = grad(lambda x_: self.cost_function_traj_flip(x_[None, :], u[None, :], x_target[None, :], u_target[None, :], Q, R, jnp.zeros((self.n, self.n))))(x)
+        lu = grad(lambda u_: self.cost_function_traj_flip(x[None, :], u_[None, :], x_target[None, :], u_target[None, :], Q, R, jnp.zeros((self.n, self.n))))(u)
+        lxx = hessian(lambda x_: self.cost_function_traj_flip(x_[None, :], u[None, :], x_target[None, :], u_target[None, :], Q, R, jnp.zeros((self.n, self.n))))(x)
+        luu = hessian(lambda u_: self.cost_function_traj_flip(x[None, :], u_[None, :], x_target[None, :], u_target[None, :], Q, R, jnp.zeros((self.n, self.n))))(u)
+        lux = jacobian(lambda u_: grad(lambda x_: self.cost_function_traj_flip(x_[None, :], u_[None, :], x_target[None, :], u_target[None, :], Q, R, jnp.zeros((self.n, self.n))))(x))(u)
+        return lx, lu, lxx, luu, lux
 
-        Инициализация траектории состояний и управления.
-        -    Вычисление начальной стоимости.
-        -    Основной цикл (до max_iter):
-        -    Вычисление Якобианов динамики A, B по всей траектории.
-        Backward pass:
-        -    Итеративно вычисляются приросты стоимостей Vx, Vxx, и матрицы обратной связи K и смещения d.
-        Forward pass (пока не реализован в обрезанном коде): строится новая траектория с учётом K, d.
-        -    Пересчитывается стоимость и проверяется сходимость по tol.
+    def backward_pass(self, X, U, x_target_traj, u_target_traj, Q, R, Qf):
+        Vx = grad(lambda x: jnp.dot((x - x_target_traj[-1]), Qf @ (x - x_target_traj[-1])))(X[-1])
+        Vxx = Qf
+        K_list = []
+        k_list = []
 
-        """
-        horizon = self.N
-        state_dim = self.n
+        for k in reversed(range(self.N)):
+            xk = X[k]
+            uk = U[k]
+            xt = x_target_traj[k]
+            ut = u_target_traj[k]
 
-        u_traj = u_init.copy()
-        x_traj = np.zeros((horizon, state_dim))
-        x_traj[0] = x0
+            A, B = self.linearize_dynamics(xk, uk)
+            lx, lu, lxx, luu, lux = self.quadratize_cost(xk, uk, xt, ut, Q, R)
 
-        for k in range(horizon-1):
-            x_traj[k+1] = self.fx_batch(x_traj[k:k+1], u_traj[k:k+1], self.dt)[0]
+            Qx = lx + A.T @ Vx
+            Qu = lu + B.T @ Vx
+            Qxx = lxx + A.T @ Vxx @ A
+            Quu = luu + B.T @ Vxx @ B
+            Qux = lux + B.T @ Vxx @ A
 
-        prev_cost = self.cost_function_traj_flip(x_traj, u_traj, x_goal, u_target_traj, Q, R, Qf, self.N * self.dt, self.dt)
+            Quu_reg = Quu + 1e-6 * jnp.eye(self.m)  # регуляризация
+            Quu_inv = jnp.linalg.inv(Quu_reg)
 
-        for iteration in range(max_iter):
-            A_list = []
-            B_list = []
+            K = -Quu_inv @ Qux
+            kff = -Quu_inv @ Qu
 
-            for k in range(horizon-1):
-                A, B = self.finite_difference_jacobian_batch(self.fx_batch, x_traj[k], u_traj[k], self.dt)
-                A_list.append(A)
-                B_list.append(B)
+            Vx = Qx + K.T @ Quu @ kff + K.T @ Qu + Qux.T @ kff
+            Vxx = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
 
-            # Backward pass
-            Vx = Qf @ (x_traj[-1] - x_goal)
-            Vxx = Qf.copy()
+            K_list.insert(0, K)
+            k_list.insert(0, kff)
 
-            K_list = []
-            d_list = []
+        return K_list, k_list
 
-            for k in reversed(range(horizon-1)):
-                A = A_list[k]
-                B = B_list[k]
+    def forward_pass(self, X, U, k_list, K_list, alpha):
+        x = X[0]
+        X_new = [x]
+        U_new = []
+        for k in range(self.N):
+            dx = x - X[k]
+            du = k_list[k] + K_list[k] @ dx
+            u_new = U[k] + alpha * du
+            U_new.append(u_new)
+            x = self.f(x, u_new, self.dt)
+            X_new.append(x)
+        return jnp.stack(X_new), jnp.stack(U_new)
 
-                Qx = Q @ (x_traj[k] - x_goal) + A.T @ Vx
-                Qu = R @ u_traj[k] + B.T @ Vx
-                Qxx = Q + A.T @ Vxx @ A
-                Quu = R + B.T @ Vxx @ B
-                Qux = B.T @ Vxx @ A
+    def solve(self, x0, u_init, x_target_traj, u_target_traj, Q, R, Qf,
+              max_iters=100, tol=1e-3, alpha=1.0):
+        X = self.simulate_trajectory(x0, u_init)
+        U = u_init
 
-                du = -np.linalg.solve(Quu, Qu) #du = -np.linalg.lstsq(Quu, Qu, rcond=None)[0]
-                K = -np.linalg.solve(Quu, Qux) 
+        for i in range(max_iters):
+            cost_prev = self.cost_function_traj_flip(X, U, x_target_traj, u_target_traj, Q, R, Qf)
+            K_list, k_list = self.backward_pass(X, U, x_target_traj, u_target_traj, Q, R, Qf)
+            X_new, U_new = self.forward_pass(X, U, k_list, K_list, alpha)
+            cost_new = self.cost_function_traj_flip(X_new, U_new, x_target_traj, u_target_traj, Q, R, Qf)
 
-                K_list.insert(0, K)
-                d_list.insert(0, du)
-
-                Vx = Qx + K.T @ Quu @ du + K.T @ Qu + Qux.T @ du
-                Vxx = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
-
-            # Forward pass
-            x_new = np.zeros_like(x_traj)
-            u_new = np.zeros_like(u_traj)
-            x_new[0] = x0
-
-            for k in range(horizon-1):
-                du = d_list[k] + K_list[k] @ (x_new[k] - x_traj[k])
-                u_new[k] = u_traj[k] + du
-                x_new[k+1] = self.f(x_new[k:k+1], u_new[k:k+1], self.dt)[0]
-
-            cost = self.cost_function_traj_flip(x_new, u_new, x_goal, u_target_traj, Q, R, Qf, self.N * self.dt, self.dt)
-
-            if iteration > 0 and abs(prev_cost - cost) < tol:
-                print(f'Converged at iteration {iteration}, cost: {cost}')
+            if jnp.abs(cost_prev - cost_new) < tol:
                 break
+            X, U = X_new, U_new
 
-            prev_cost = cost
-            x_traj = x_new
-            u_traj = u_new
+        return X, U, i, cost_new
 
-        return x_traj, u_traj
 
 class ModelPredictiveController:
     def __init__(self, dt, horizon, Q, R, Qf, n, m):
@@ -1064,28 +876,57 @@ class ModelPredictiveController:
         self.Qf = Qf
         self.n = n
         self.m = m
+        # Инициализация ILQR оптимизатора
         self.optimizer = ILQROptimizer(
-            dt=dt,
-            horizon=horizon,
-            state_dim=n,
-            control_dim=m
-        )
+            dynamics_func=f, 
+            cost_function_traj_flip=self.cost_function_traj_flip, 
+            N=horizon, 
+            n=n, 
+            m=m, 
+            dt=dt)
+          
+    def cost_function_traj_flip(x_traj, u_traj, x_target_traj, u_target_traj, Q, R, Qf):
+        def compute_step_cost(x, u, x_target, u_target):
+            position_error = x[0:3] - x_target[0:3]
+            q_current = x[6:10] / jnp.linalg.norm(x[6:10])
+            q_target = x_target[6:10] / jnp.linalg.norm(x_target[6:10])
+            dot_product = jnp.clip(jnp.dot(q_current, q_target), -1.0, 1.0)
+            orientation_error = 2.0 * jnp.arccos(jnp.abs(dot_product))
+            control_error = u - u_target
+            return (position_error @ position_error) * Q + orientation_error**2 * Q + (control_error @ control_error) * R
 
-    def step(self, x0, u_init, x_goal, u_target_traj):
+        # Суммарная промежуточная стоимость
+        total_cost = jnp.sum(jax.vmap(compute_step_cost)(
+            x_traj[:-1], u_traj, x_target_traj[:-1], u_target_traj))
+
+        # Стоимость терминального состояния
+        terminal_error = x_traj[-1] - x_target_traj[-1]
+        terminal_cost = terminal_error @ Qf @ terminal_error
+
+        return total_cost + terminal_cost
+    
+    def step(self, x0, u_init, x_target_traj, u_target_traj):
         """
         Вычисляет оптимальную траекторию состояний и управляющих воздействий
         от текущего состояния x0, используя iLQR.
-        """
-        x_traj_opt, u_traj_opt = self.optimizer.solve(
+        """ 
+        # Используем ILQR для расчета оптимальной траектории
+        X_opt, U_opt, i_final, cost_final = self.optimizer.solve( 
             x0=x0,
             u_init=u_init,
             Q=self.Q,
             R=self.R,
             Qf=self.Qf,
-            x_goal=x_goal,
+            x_target_traj=x_target_traj,
             u_target_traj=u_target_traj
-        )
-        return x_traj_opt, u_traj_opt[0]  # Возвращаем x_traj_opt и первое управляющее воздействие (как в MPC)
+        ) 
+        # MPC работает по принципу "перепланирования" на каждом шаге
+        # Выбираем управляющее воздействие на текущем шаге
+        u_optimal = U_opt[0]  # Выбираем первое управление из оптимизированной траектории
+
+        # Возвращаем оптимальные состояния, управляющие воздействия и информацию о стоимости
+        return X_opt, u_optimal, i_final, cost_final
+
    
  
 def main(args=None):
