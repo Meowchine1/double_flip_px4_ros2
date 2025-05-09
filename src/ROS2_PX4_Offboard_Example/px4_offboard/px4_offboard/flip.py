@@ -18,7 +18,7 @@ from px4_offboard.mpc_controller import MPCController
 from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Odometry  # inner ROS2 SEKF
 from std_msgs.msg import String
-
+from rclpy.qos import QoSProfile
 from quad_flip_msgs.msg import OptimizedTraj
 
 BOUNCE_TIME = 0.6
@@ -40,6 +40,8 @@ class DroneState(Enum):
 class FlipControlNode(Node):
     def __init__(self):
         super().__init__('flip_control_node')
+
+        #qos_profile = QoSProfile(depth=10)
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -47,7 +49,6 @@ class FlipControlNode(Node):
             depth=10
         ) 
          
-
         self.vehicle_command_publisher = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
         self.offboard_control_mode_publisher = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
         self.trajectory_setpoint_publisher = self.create_publisher(TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)

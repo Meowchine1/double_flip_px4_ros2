@@ -4,8 +4,8 @@ from geometry_msgs.msg import PoseStamped, Vector3, Quaternion
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
 from std_msgs.msg import Float32MultiArray
-from px4_msgs.msg import (VehicleAttitude, VehicleImu, ActuatorOutputs, 
-                          VehicleLocalPosition,SensorCombined,VehicleAngularVelocity,
+from px4_msgs.msg import (VehicleAttitude, VehicleImu, ActuatorOutputs, ActuatorMotors, ActuatorControls,
+                          VehicleLocalPosition,SensorCombined,VehicleAngularVelocity, 
                           VehicleAngularAccelerationSetpoint, VehicleMagnetometer, SensorBaro) # TODO CONNECT VehicleMagnetometer SensorBaro
 import numpy as np
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -20,7 +20,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 import casadi as ca
 
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 from std_msgs.msg import String
  
 from datetime import datetime
@@ -30,6 +30,8 @@ import jax.numpy as jnp
 from jax import grad, jacobian, hessian
 
 from quad_flip_msgs.msg import OptimizedTraj
+
+from rclpy.qos import QoSProfile
 
 # ======= CONSTANTS =======
 SEA_LEVEL_PRESSURE = 101325.0
@@ -111,26 +113,26 @@ def f(x, u, dt):
     x_next = jnp.concatenate([new_pos, new_vel, new_quat, new_omega])  # Собираем новое состояние
     return x_next
 
-def plot_trajectory(x_traj_opt, x_goal=None, title="Optimized Trajectory"):
-    x = x_traj_opt[:, 0]
-    y = x_traj_opt[:, 1]
-    z = x_traj_opt[:, 2]
+# def plot_trajectory(x_traj_opt, x_goal=None, title="Optimized Trajectory"):
+#     x = x_traj_opt[:, 0]
+#     y = x_traj_opt[:, 1]
+#     z = x_traj_opt[:, 2]
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot(x, y, z, label='Predicted trajectory', color='blue')
-    ax.scatter(x[0], y[0], z[0], color='green', label='Start')
-    ax.scatter(x[-1], y[-1], z[-1], color='red', label='End')
+#     fig = plt.figure()
+#     ax = fig.add_subplot(111, projection='3d')
+#     ax.plot(x, y, z, label='Predicted trajectory', color='blue')
+#     ax.scatter(x[0], y[0], z[0], color='green', label='Start')
+#     ax.scatter(x[-1], y[-1], z[-1], color='red', label='End')
 
-    if x_goal is not None:
-        ax.scatter(x_goal[0], x_goal[1], x_goal[2], color='orange', label='Goal', s=100, marker='X')
+#     if x_goal is not None:
+#         ax.scatter(x_goal[0], x_goal[1], x_goal[2], color='orange', label='Goal', s=100, marker='X')
 
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_title(title)
-    ax.legend()
-    plt.show()
+#     ax.set_xlabel('X')
+#     ax.set_ylabel('Y')
+#     ax.set_zlabel('Z')
+#     ax.set_title(title)
+#     ax.legend()
+#     plt.show()
 
 def publish_trajectory_marker(pub, x_traj_opt, frame_id="map"):
     marker = Marker()
@@ -173,8 +175,9 @@ class DynamicModelNode(Node):
     def __init__(self):
         super().__init__('dynamic_model_node')
         
-        self.get_logger().info(f"DynamicModelNode") 
+        #self.get_logger().info(f"DynamicModelNode") 
 
+        qos_profile_for_odom = QoSProfile(depth=10)  # стандартный: reliability=RELIABLE, durability=VOLATILE
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -192,6 +195,8 @@ class DynamicModelNode(Node):
         self.baro_pub = self.create_publisher(FluidPressure, '/baro', qos_profile)
         self.ekf_state_pub = self.create_publisher(Float32MultiArray, '/ekf/state', qos_profile)
 
+         
+
         #trajectory visualisation
         self.traj_pub = self.create_publisher(Marker, "/mpc/trajectory", qos_profile)
 
@@ -204,13 +209,19 @@ class DynamicModelNode(Node):
         self.create_subscription(VehicleAngularAccelerationSetpoint,
         '/fmu/out/vehicle_angular_acceleration_setpoint', self.vehicle_angular_acceleration_setpoint_callback, qos_profile)
         self.create_subscription(VehicleImu,'/fmu/out/vehicle_imu',self.vehicle_imu_callback, qos_profile)
+
+
         self.create_subscription(ActuatorOutputs, '/fmu/out/actuator_outputs', self.actuator_outputs_callback, qos_profile)
+        self.create_subscription(ActuatorControls, '/fmu/out/actuator_controls', self.actuator_controls_callback, qos_profile)
+        self.create_subscription(ActuatorMotors, '/fmu/out/actuator_motors', self.actuator_motors_callback, qos_profile) 
+ 
+        
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position', self.vehicle_local_position_callback, qos_profile)
         self.create_subscription(SensorBaro, '/fmu/out/sensor_baro', self.sensor_baro_callback, qos_profile)
         self.create_subscription(VehicleMagnetometer, '/fmu/out/vehicle_magnetometer', self.vehicle_magnetometer_callback, qos_profile)
         
         # ekf_filter_node data
-        self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, qos_profile)
+        self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, qos_profile_for_odom)
 
         # == == == =DATA USED IN METHODS= == == == 
         self.angularVelocity = np.zeros(3, dtype=np.float32)
@@ -331,16 +342,21 @@ class DynamicModelNode(Node):
         self.cost_final = 0.0
         self.done = False 
         self.to_client_f = False
+
+
+    # =============================нет колбека========================================
+    def actuator_outputs_callback(self, msg: ActuatorOutputs):
+        pwm_outputs = msg.output[:4]  # предполагаем, что 0-3 — это моторы
+        # Преобразование PWM в радианы в секунду (линейное приближение)
+         
+        self.motor_inputs = np.clip((np.array(pwm_outputs) - 1000.0) / 1000.0 * MAX_SPEED, 0.0, MAX_SPEED)
+        self.get_logger().info(f"actuator_outputs_callback {msg}")
+
+    
  
-    def send_optimized_traj(self):
-        if self.optimized_traj_f:
-            msg = OptimizedTraj()
-            msg.x_opt = np.asarray(self.X_opt).flatten().astype(np.float32).tolist()
-            msg.u_opt = np.asarray(self.u_optimal).flatten().astype(np.float32).tolist()
-            msg.i_final = int(self.i_final)
-            msg.cost_final = float(self.cost_final)
-            msg.done = self.done
-            self.pub_optimized_traj.publish(msg)
+    def actuator_motors_callback(self, msg):
+        self.get_logger().info(f"actuator_outputs_callback {msg}")
+
 
     def client_msg_callback(self, msg):#
         """GET CLIENT MESSAGES"""
@@ -352,6 +368,27 @@ class DynamicModelNode(Node):
             self.optimized_traj_f = True 
         else:
             self.get_logger().warn(f"Unknown command: {command}") 
+
+
+    def odom_callback(self, msg: Odometry):
+        self.get_logger().info("odom_callback")
+        self.odom_callback_position = msg.pose.pose.position
+        self.odom_callback_orientation = msg.pose.pose.orientation
+
+
+    # ==============================нет колбека=======================================
+
+    def send_optimized_traj(self):
+        if self.optimized_traj_f:
+            msg = OptimizedTraj()
+            msg.x_opt = np.asarray(self.X_opt).flatten().astype(np.float32).tolist()
+            msg.u_opt = np.asarray(self.u_optimal).flatten().astype(np.float32).tolist()
+            msg.i_final = int(self.i_final)
+            msg.cost_final = float(self.cost_final)
+            msg.done = self.done
+            self.pub_optimized_traj.publish(msg)
+
+ 
  
     # def publish_trajectory_marker(pub, x_traj_opt, frame_id="map"):
     #     marker = Marker()
@@ -389,7 +426,7 @@ class DynamicModelNode(Node):
             x0 = self.ekf.x.copy()  # [13] x, y, z, vel, q, omega
             u_init = jnp.tile(self.motor_inputs, (self.horizon, 1))  # [horizon, 4]
             x_target_traj = jnp.zeros((self.horizon, 13))
-            u_target_traj = jnp.zeros((self.horizon, 4))
+            u_target_traj = u_target_traj = jnp.tile(self.motor_inputs, (self.horizon, 1)) #u_target_traj = jnp.zeros((self.horizon, 4))
 
             if self.phase == 'takeoff':
                 for i in range(self.horizon):
@@ -399,7 +436,7 @@ class DynamicModelNode(Node):
                     q = jnp.array([0.0, 0.0, 0.0, 1.0])
                     omega = jnp.zeros(3)
                     x_target_traj = x_target_traj.at[i].set(jnp.concatenate([pos, vel, q, omega]))
-                    u_target_traj = u_target_traj.at[i].set(self.recovery_thrust.copy())
+                    u_target_traj = u_target_traj.at[i].set(self.motor_inputs.copy())
 
                 if abs(self.ekf.x[2] - self.takeoff_altitude) < self.takeoff_tol:
                     self.phase = 'flip'
@@ -474,7 +511,7 @@ class DynamicModelNode(Node):
 
             # Вызов MPC
             self.X_opt, self.u_optimal, self.i_final, self.cost_final = self.mpc.step(
-                t=current_time,
+                #t=current_time,
                 x0=x0,
                 u_init=u_init,
                 x_target_traj=x_target_traj[-1],
@@ -485,7 +522,7 @@ class DynamicModelNode(Node):
             #publish_trajectory_marker(self.traj_pub, self.X_opt)
 
     def ekf_filter_node_t(self):
-        self.get_logger().info("ekf_filter_node_t")
+        #self.get_logger().info("ekf_filter_node_t")
         
         def to_float_array(arr):
             return [float(x) for x in arr]
@@ -528,17 +565,16 @@ class DynamicModelNode(Node):
         baro_msg.fluid_pressure = float(self.baro_pressure)
         self.baro_pub.publish(baro_msg)
 
-    def publish_ekf_state(self):
-        # Создание сообщения
-        msg = Float32MultiArray()
-        msg.data = self.ekf.x.tolist()  # Преобразуем numpy массив в список для публикации
+    # def publish_ekf_state(self):
+    #     # Создание сообщения
+    #     msg = Float32MultiArray()
+    #     msg.data = self.ekf.x.tolist()  # Преобразуем numpy массив в список для публикации
 
-        # Публикуем сообщение
-        self.ekf_state_pub.publish(msg)
-        self.get_logger().info("Published EKF state")
+    #     # Публикуем сообщение
+    #     self.ekf_state_pub.publish(msg)
+    #     #self.get_logger().info("Published EKF state")
 
     def ekf_logger(self):
-        self.get_logger().info("ekf_logger")
 
         pos_my_ekf = self.ekf.x[0:3]
         pos_odom = self.odom_callback_position
@@ -627,15 +663,9 @@ class DynamicModelNode(Node):
 
         ws.append(row_values)
         wb.save(file_path)
-
-
-    def odom_callback(self, msg: Odometry):
-        self.get_logger().info("odom_callback")
-        self.odom_callback_position = msg.pose.pose.position
-        self.odom_callback_orientation = msg.pose.pose.orientation
-        
+ 
     def sensor_baro_callback(self, msg):
-        self.get_logger().info("sensor_baro_callback")
+        #self.get_logger().info("sensor_baro_callback")
         self.baro_temperature = msg.temperature
         self.baro_pressure = msg.pressure
         self.baro_attitude = 44330.0 * (1.0 - (msg.pressure / SEA_LEVEL_PRESSURE) ** 0.1903)
@@ -655,23 +685,16 @@ class DynamicModelNode(Node):
 
     def vehicle_magnetometer_callback(self, msg: VehicleMagnetometer):
         # Измерения магнитометра
-        self.get_logger().info("vehicle_magnetometer_callback")
+        #self.get_logger().info("vehicle_magnetometer_callback")
         self.magnetometer_data = np.array(msg.magnetometer_ga, dtype=np.float32)
         self.mag_yaw = self.get_yaw_from_mag()
 
     # ПОЗИЦИЯ ДЛЯ ОЦЕНКИ ИНЕРЦИАЛНОЙ ЛОКАЛИЗАЦИИ
     def vehicle_local_position_callback(self, msg: VehicleLocalPosition):
-        self.get_logger().info(f"vehicle_local_position_callback {msg.x} {msg.y} {msg.z}")
+        #self.get_logger().info(f"vehicle_local_position_callback {msg.x} {msg.y} {msg.z}")
         self.vehicleLocalPosition_position[0] = msg.x
         self.vehicleLocalPosition_position[1] = msg.y
-        self.vehicleLocalPosition_position[2] = msg.z
-
-    def actuator_outputs_callback(self, msg: ActuatorOutputs):
-        pwm_outputs = msg.output[:4]  # предполагаем, что 0-3 — это моторы
-        # Преобразование PWM в радианы в секунду (линейное приближение)
-         
-        self.motor_inputs = np.clip((np.array(pwm_outputs) - 1000.0) / 1000.0 * MAX_SPEED, 0.0, MAX_SPEED)
-        self.get_logger().info("actuator_outputs_callback")
+        self.vehicleLocalPosition_position[2] = msg.z 
 
     # ЛИНЕЙНОЕ УСКОРЕНИЕ, УГЛОВОЕ УСКОРЕНИЕ, КВАТЕРНИОН
     def sensor_combined_callback(self, msg: SensorCombined):
@@ -713,7 +736,7 @@ class DynamicModelNode(Node):
         self.motor_pub.publish(msg)
 
     def EKF(self):
-        self.get_logger().info("EKF")
+        #self.get_logger().info("EKF")
         """ Основная функция обновления фильтра Калмана. """
         vel_world = self.vehicleImu_velocity_w
         z = np.array([
@@ -777,48 +800,46 @@ class DynamicModelNode(Node):
         H[13, 2] = 1.0   # барометрический z
         return H
 
-
-
-# Функция для предсказания успешности флипа
-def predict_flip_success(x_init, u_init, duration=2.0):
-    """
-    Предсказание успешности флипа.
+# # Функция для предсказания успешности флипа
+# def predict_flip_success(x_init, u_init, duration=2.0):
+#     """
+#     Предсказание успешности флипа.
     
-    x_init: Начальное состояние (позиция, скорость, ориентация, угловая скорость).
-    u_init: Управление (обороты моторов).
-    duration: Длительность флипа в секундах.
+#     x_init: Начальное состояние (позиция, скорость, ориентация, угловая скорость).
+#     u_init: Управление (обороты моторов).
+#     duration: Длительность флипа в секундах.
     
-    Возвращает True, если флип успешен, False - если нет.
-    """
-    # Инициализация переменных
-    x = np.copy(x_init)
-    t = 0
-    time_steps = int(duration / DT)
+#     Возвращает True, если флип успешен, False - если нет.
+#     """
+#     # Инициализация переменных
+#     x = np.copy(x_init)
+#     t = 0
+#     time_steps = int(duration / DT)
     
-    # Симуляция траектории на несколько шагов вперед
-    for step in range(time_steps):
-        x = dynamic_model(x, u_init, DT)  # Обновляем состояние по динамической модели
+#     # Симуляция траектории на несколько шагов вперед
+#     for step in range(time_steps):
+#         x = dynamic_model(x, u_init, DT)  # Обновляем состояние по динамической модели
         
-        # Проверяем ограничения
-        pos = x[0:3]
-        vel = x[3:6]
-        quat = x[6:10]
-        omega = x[10:13]
+#         # Проверяем ограничения
+#         pos = x[0:3]
+#         vel = x[3:6]
+#         quat = x[6:10]
+#         omega = x[10:13]
         
-        # Ограничение по высоте
-        if pos[2] < 0 or pos[2] > MAX_HEIGHT:
-            return False  # Если высота выходит за пределы, флип неуспешен
+#         # Ограничение по высоте
+#         if pos[2] < 0 or pos[2] > MAX_HEIGHT:
+#             return False  # Если высота выходит за пределы, флип неуспешен
         
-        # Ограничение по угловой скорости
-        if np.abs(omega[0]) > MAX_RATE or np.abs(omega[1]) > MAX_RATE or np.abs(omega[2]) > MAX_RATE:
-            return False  # Если угловая скорость превышает допустимую, флип неуспешен
+#         # Ограничение по угловой скорости
+#         if np.abs(omega[0]) > MAX_RATE or np.abs(omega[1]) > MAX_RATE or np.abs(omega[2]) > MAX_RATE:
+#             return False  # Если угловая скорость превышает допустимую, флип неуспешен
         
-        # Ограничение по вертикальной скорости
-        if np.abs(vel[2]) > 10:  # можно изменить это значение, если нужно
-            return False  # Если вертикальная скорость слишком велика, флип неуспешен
+#         # Ограничение по вертикальной скорости
+#         if np.abs(vel[2]) > 10:  # можно изменить это значение, если нужно
+#             return False  # Если вертикальная скорость слишком велика, флип неуспешен
     
-    # Если все ограничения соблюдены, флип успешен
-    return True 
+#     # Если все ограничения соблюдены, флип успешен
+#     return True 
 
 
 class ILQROptimizer:
