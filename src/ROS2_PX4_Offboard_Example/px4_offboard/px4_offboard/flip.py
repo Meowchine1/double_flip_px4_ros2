@@ -19,7 +19,7 @@ from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Odometry  # inner ROS2 SEKF
 from std_msgs.msg import String
 
-from quad_flip_interfaces.msg import OptimizedTraj
+from quad_flip_msgs.msg import OptimizedTraj
 
 BOUNCE_TIME = 0.6
 ACCELERATE_TIME = 0.07
@@ -47,18 +47,16 @@ class FlipControlNode(Node):
             depth=10
         ) 
          
+
         self.vehicle_command_publisher = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', qos_profile)
         self.offboard_control_mode_publisher = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
         self.trajectory_setpoint_publisher = self.create_publisher(TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
-        self.motor_pub = self.create_publisher(ActuatorMotors, '/fmu/in/actuator_motors', qos_profile)
         self.vehicle_rates_publisher = self.create_publisher(VehicleRatesSetpoint, '/fmu/in/vehicle_rates_setpoint', qos_profile)
         self.vehicle_torque_publisher = self.create_publisher(VehicleTorqueSetpoint, '/fmu/in/vehicle_torque_setpoint', qos_profile)
         self.publisher_rates = self.create_publisher(VehicleRatesSetpoint, '/fmu/in/vehicle_rates_setpoint', qos_profile)
         self.publisher_att = self.create_publisher(VehicleAttitudeSetpoint, '/fmu/in/vehicle_attitude_setpoint', qos_profile)
   
-        self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile) 
-        self.create_subscription(ActuatorMotors, '/fmu/out/actuator_motors', self.actuator_motors_callback, qos_profile)
-        self.create_subscription(TrajectorySetpoint, '/fmu/out/trajectory_setpoint', self.trajectory_setpoint_callback, qos_profile)
+        self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', self.vehicle_status_callback, qos_profile)
        
         # == == == =STATE CONTROL= == == == 
         self.main_state = DroneState.INIT
@@ -82,58 +80,59 @@ class FlipControlNode(Node):
 
         # MPC INTEGRATION API
         self.pub_to_mpc = self.create_publisher(String, '/drone/client_msg', qos_profile)#
-
         self.create_subscription(OptimizedTraj, '/drone/optimized_traj', self.optimized_traj_callback, qos_profile)
-        self.X_opt = np.zeros((self.horizon + 1, self.n))  # (N+1) x n
-        self.u_optimal = np.zeros((self.horizon, self.m))  # N x m
-        self.i_final = 0
-        self.cost_final = 0.0
+        self.create_subscription(String, '/drone/server_msg', self.server_msg_callback, qos_profile)
+         
+        # TODO FROOM FILE
+        self.horizon = 50  # Горизонт предсказания
+        self.n = 13  # Размерность состояния квадрокоптера (позиция, скорость, ориентация, угловая скорость)
+        self.m = 4  # Размерность управления (4 мотора)
 
-        self.create_subscription(Vector3, '/drone/mpc_data', self.mpc_data_callback, qos_profile)
+        self.received_x_opt = None
+        self.received_u_opt = None
+        self.received_i_final = None
+        self.received_cost_final = None
+        self.received_done = None
+
         self.target_u, self.target_x = [], []
          
         self.takeoff_alt = 0.0
-        self.mpc_takeoff = False
-        self.mpc_flip = False 
+        self.mpc_takeoff = False 
  
-    def optimized_traj_callback(self, msg):
-        x_dim = self.n   # например, размерность состояния
-        u_dim = self.m   # размерность управления
-        T = self.horizon # длина горизонта
+    def optimized_traj_callback(self, msg: OptimizedTraj):
+        self.received_x_opt = np.array(msg.x_opt, dtype=np.float32)
+        self.received_u_opt = np.array(msg.u_opt, dtype=np.float32)
+        self.received_i_final = msg.i_final
+        self.received_cost_final = msg.cost_final
+        self.received_done = msg.done
 
-        self.X_opt = np.array(msg.x_opt, dtype=np.float32).reshape(T + 1, x_dim)
-        self.u_optimal = np.array(msg.u_opt, dtype=np.float32).reshape(T, u_dim)
-        self.i_final = msg.i_final
-        self.cost_final = msg.cost_final
-    
-    def mpc_data_callback(self, msg):
-        self.takeoff_alt = msg.data[0]
-        self.mpc_takeoff = msg.data[1]
-        self.mpc_flip = msg.data[2]
-
-    
-    def send_message(self, msg):#
+    def send_message_to_server(self, msg):#
         ros_msg = String()
         ros_msg.data = msg
         self.pub_to_mpc.publish(ros_msg)
         #self.get_logger().info(f'Sent to MPC: {msg}')
 
-    def get_control_from_mpc(self):
-        pass
-
+    def server_msg_callback(self, msg):
+        if msg =="land":
+            self.main_state == DroneState.LANDING
+        elif msg =="flip":
+            self.main_state = DroneState.FLIP
 
     def vehicle_status_callback(self, msg): 
         """Обновляет состояние дрона."""
         #self.get_logger().info('vehicle_status_callback')
         self.vehicle_status = msg
         self.arming_state = msg.arming_state
-     
+    
 # MOTOR MANAGEMENT
-    def send_motor_commands(self, motor_inputs):
+    def send_motor_commands(self):
         # нормализованные значения [0,1] — переводим в pwm/thrust команды
+        motor_inputs = self.received_u_opt ## обратная динамика
         msg = ActuatorMotors()
         msg.control = list(np.clip(motor_inputs, 0.0, 1.0))
         self.motor_pub.publish(msg)
+
+
     def reset_rate_pid(self): 
         self.publish_rate_setpoint(roll_rate=0.0, pitch_rate=0.0, yaw_rate=0.0)
         self.get_logger().info(f'reset_rate_pid')
@@ -273,7 +272,7 @@ class FlipControlNode(Node):
             if self.arming_state == VehicleStatus.ARMING_STATE_ARMED:
                 self.get_logger().info('ARMING_STATE_ARMED')
                 self.main_state = DroneState.TAKEOFF
-                self.send_message("takeoff")#
+                self.send_message_to_server("takeoff")#
             else:
                 self.set_offboard_mode()
                 self.arm()
@@ -284,10 +283,9 @@ class FlipControlNode(Node):
                 self.main_state = DroneState.FLIP
    
         elif self.main_state == DroneState.FLIP: 
-            optimal_motor_inputs, optimal_trajectory = self.get_control_from_mpc()  # Вычисление оптимального управляющего воздействия
+            optimal_motor_inputs = self.get_control_from_mpc()  # Вычисление оптимального управляющего воздействия
             self.send_motor_commands(optimal_motor_inputs)
-            if  self.mpc_flip:
-                self.main_stateDroneState.LANDING
+
             
                 
         elif self.main_state == DroneState.LANDING:
